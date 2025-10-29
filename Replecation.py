@@ -11,3 +11,11 @@ from itertools import takewhile
 import re
 from sentence_transformers import SentenceTransformer, CrossEncoder, util
 from itertools import chain
+
+# pip uninstall torch torchvision torchaudio -y
+# pip install torch==2.2.2
+# pip install torchvision==0.17.2
+# pip install torchaudio==2.2.2
+# !pip install protobuf==3.20.3
+
+# Importing the models
