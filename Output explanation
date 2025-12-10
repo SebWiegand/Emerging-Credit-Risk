@@ -1,0 +1,99 @@
+# Explanation of Textual Factor Output Files
+# -----------------------------------------
+# This document describes the meaning of each CSV file produced by the
+# textual factor modeling pipeline (Word2Vec → Clustering → SVD topics).
+# It is intended as reference documentation inside the project.
+
+-------------------------------------------------------------------------------
+1. topics_words.csv
+-------------------------------------------------------------------------------
+This file lists all discovered topics (clusters) and the words that define them.
+
+Columns:
+- topic_id    : numeric ID of the topic (e.g., 0, 1, 2, ...)
+- word        : a vocabulary term assigned to the topic
+- weight      : importance of the word in defining that topic (SVD loading)
+
+Interpretation:
+- This file tells you what each topic *means*.
+- High-weight words form the semantic core of the topic.
+- Used for naming topics (e.g., "Liquidity Risk", "Governance", "Capital Ratios").
+
+-------------------------------------------------------------------------------
+2. topic_importances.csv
+-------------------------------------------------------------------------------
+This file reports how important each topic is relative to the entire corpus.
+
+Columns:
+- topic_id           : numeric ID
+- singular_value     : SVD strength of the topic
+- importance         : normalized importance (share of total variance explained)
+
+Interpretation:
+- Higher values = more influential topics.
+- Helps identify the dominant themes in the annual reports.
+
+-------------------------------------------------------------------------------
+3. singular_values.csv
+-------------------------------------------------------------------------------
+This file contains only the SVD singular values for each topic.
+
+Columns:
+- topic_id
+- singular_value
+
+Interpretation:
+- These values represent the raw mathematical strength of each latent factor.
+- Mainly used for diagnostics and to see the decay pattern (e.g., elbow curves).
+
+-------------------------------------------------------------------------------
+4. first_doc_topics.csv
+-------------------------------------------------------------------------------
+This file gives document-level loadings for the FIRST SVD factor of each topic.
+
+Columns:
+- doc_id      : ID of the document/paragraph
+- topic_id    : numeric topic ID
+- loading     : how strongly the document expresses that topic
+
+Interpretation:
+- This is the primary representation of topic usage in each paragraph.
+- High loading = the document heavily discusses this theme.
+- Used later for aggregation into bank-year textual risk measures.
+
+-------------------------------------------------------------------------------
+5. second_doc_topics.csv
+-------------------------------------------------------------------------------
+This file provides the SECOND SVD factor loadings for each topic and document.
+
+Columns:
+- doc_id
+- topic_id
+- score       : secondary semantic dimension of the topic
+
+Interpretation:
+- Represents nuance or substructure within each topic.
+- Often optional for analysis; the first factor carries the main meaning.
+- Useful when distinguishing directionality or subthemes.
+
+-------------------------------------------------------------------------------
+Usage Summary
+-------------------------------------------------------------------------------
+- topics_words.csv        → Naming and interpreting topics
+- topic_importances.csv   → Ranking topic relevance
+- singular_values.csv     → Diagnostic checks on SVD structure
+- first_doc_topics.csv    → Main dataset for regressions and analysis
+- second_doc_topics.csv   → Optional extended semantic information
+
+-------------------------------------------------------------------------------
+Recommended Workflow
+-------------------------------------------------------------------------------
+1. Inspect topics_words.csv to understand what each topic represents.
+2. Use first_doc_topics.csv to link topics to documents and later to banks/years.
+3. Filter or prioritize topics based on topic_importances.csv.
+4. Use singular_values.csv only for checking model quality.
+5. Use second_doc_topics.csv only if you need deeper semantic dimensions.
+
+-------------------------------------------------------------------------------
+End of File
+-------------------------------------------------------------------------------
