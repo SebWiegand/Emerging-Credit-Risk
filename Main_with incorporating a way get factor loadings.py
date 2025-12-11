@@ -246,7 +246,7 @@ def train_word2vec(df):
                         where V = vocab size, D = embedding dimension
     """
 
-    # df['tokens'] is a list of tokens per document (from calculate_word_frequencies)
+    # df['tokens'] is a list of tokens per document
     tokenized_docs = df["tokens"].tolist()
 
     print("Number of documents going into Word2Vec:", len(tokenized_docs))
@@ -256,52 +256,70 @@ def train_word2vec(df):
     if len(tokenized_docs) == 0:
         raise RuntimeError("No documents available for Word2Vec training.")
 
+    # ------------------------------------------------------------
     # Train the Word2Vec model
+    # ------------------------------------------------------------
     w2v_model = Word2Vec(
         sentences=tokenized_docs,
-        vector_size=100,  # embedding dimension (D)
-        window=5,         # context window size
-        min_count=5,      # ignore words that appear fewer than 5 times
-        workers=4,        # number of CPU cores to use
-        sg=1,             # 1 = skip-gram, 0 = CBOW
+        vector_size=100,   # embedding dimension
+        window=5,          # context window size
+        min_count=5,       # ignore rare words
+        workers=4,         # CPU cores
+        sg=1,              # skip-gram model
     )
 
-    # Get the learned word vectors
+    # Extract vocabulary and vectors
     word_vectors = w2v_model.wv
     vocab = list(word_vectors.key_to_index.keys())
     embedding_dim = word_vectors.vector_size
 
-    # Build an embedding matrix aligned with vocab
+    # ------------------------------------------------------------
+    # Build embedding matrix aligned to vocabulary
+    # ------------------------------------------------------------
     embedding_matrix = np.zeros((len(vocab), embedding_dim), dtype=np.float32)
     for i, w in enumerate(vocab):
         embedding_matrix[i, :] = word_vectors[w]
 
     print(f"Trained Word2Vec: {len(vocab)} words, dim={embedding_dim}")
+
+    # ------------------------------------------------------------
+    # SAVE embedding_matrix so tune_lsh.py can load it
+    # ------------------------------------------------------------
+    np.save("embedding_matrix.npy", embedding_matrix)
+    print("Saved embedding_matrix.npy in:", os.getcwd())
+
     return w2v_model, vocab, embedding_matrix
 
-# Output:
-# - w2v_model        : trained Word2Vec model
-# - vocab            : list of all words in the model's vocabulary
-# - embedding_matrix : 2D array with one vector per word in 'vocab'
 
 # ============================================================
 # 5. CLUSTER WORD EMBEDDINGS (NeighborFinder + EmbeddingCluster)
+#    using pre-tuned FAISS LSH parameters
 # ============================================================
 
+# ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
+N_BITS = 128    # number of hash bits = hyperplanes per table  (example)
+N_TABLES = 16   # number of hash tables                       (example)
 
-def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
+
+def cluster_words(
+    embedding_matrix,
+    cluster_size=50,
+    neighbor_alg="lsh",
+):
     """
     Cluster word embeddings into semantic groups.
 
     Steps:
-    1) Build a NeighborFinder (creates brute-force + LSH indices).
-    2) Build an EmbeddingCluster object.
-    3) Run sequential clustering to group similar words.
+    1) Build a NeighborFinder (creates brute-force index).
+    2) If neighbor_alg == "lsh", create an LSH index with pre-tuned
+       (N_BITS, N_TABLES) and attach it to the NeighborFinder.
+    3) Build an EmbeddingCluster object.
+    4) Run sequential clustering to group similar words.
 
     Inputs:
     - embedding_matrix : numpy array (V x D) from Word2Vec
     - cluster_size     : approx. number of words per cluster
-    - neighbor_alg     : "lsh" (fast) or "brutal" (exact)
+    - neighbor_alg     : "lsh" (fast, uses FAISS LSH) or "brutal" (exact)
 
     Outputs:
     - ec                : EmbeddingCluster object
@@ -310,17 +328,27 @@ def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
     - word_cluster_map  : word index → cluster ID mapping
     """
 
-    # 1) Build LSH + brute-force neighbor search engine
+    # 1) Build neighbor search engine (brute-force index always built inside)
     nf = NeighborFinder(
         embedding_matrix,
         random_state=42,
-        num_queries=1000   # evaluates LSH accuracy
+        num_queries=1000,   # used for their internal diagnostics if needed
     )
 
-    # 2) Create clustering engine using chosen neighbor algorithm
+    # 2) If we use LSH, create the FAISS LSH index with tuned parameters
+    if neighbor_alg == "lsh":
+        print(
+            f"Using FAISS LSH with tuned parameters: "
+            f"bits={N_BITS}, tables={N_TABLES}"
+        )
+        nf.lsh_index = nf.create_lsh_index(N_BITS, N_TABLES)
+    else:
+        print("Using brute-force neighbor search (no LSH).")
+
+    # 3) Create clustering engine using chosen neighbor algorithm
     ec = EmbeddingCluster(nf, neighbor_alg=neighbor_alg)
 
-    # 3) Perform clustering (Cong et al.'s sequential clustering)
+    # 4) Perform clustering (Cong et al.'s sequential clustering)
     clusters = ec.sequentialcluster(cluster_size=cluster_size)
 
     # Map clusters <-> words
@@ -330,74 +358,22 @@ def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
 
     return ec, clusters, cluster_words_map, word_cluster_map
 
-# Output:
-# - clusters : semantic word clusters
-# - word_cluster_map : tells you which cluster each word belongs to
-# - cluster_words_map : tells you which words are in each cluster
-
-
-
-# ============================================================
-# 5. CLUSTER WORD EMBEDDINGS (NeighborFinder + EmbeddingCluster)
-# ============================================================
-
-from TextualFactors import NeighborFinder, EmbeddingCluster
-
-def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
-    """
-    Cluster word embeddings into semantic groups.
-
-    Steps:
-    1) Build a NeighborFinder (creates brute-force + LSH indices).
-    2) Build an EmbeddingCluster object.
-    3) Run sequential clustering to group similar words.
-
-    Inputs:
-    - embedding_matrix : numpy array (V x D) from Word2Vec
-    - cluster_size     : approx. number of words per cluster
-    - neighbor_alg     : "lsh" (fast) or "brutal" (exact)
-
-    Outputs:
-    - ec                : EmbeddingCluster object
-    - clusters          : list of clusters (each cluster = list of word indices)
-    - cluster_words_map : cluster → words mapping
-    - word_cluster_map  : word index → cluster ID mapping
-    """
-
-    # 1) Build LSH + brute-force neighbor search engine
-    nf = NeighborFinder(
-        embedding_matrix,
-        random_state=42,
-        num_queries=1000   # evaluates LSH accuracy
-    )
-
-    # 2) Create clustering engine using chosen neighbor algorithm
-    ec = EmbeddingCluster(nf, neighbor_alg=neighbor_alg)
-
-    # 3) Perform clustering (Cong et al.'s sequential clustering)
-    clusters = ec.sequentialcluster(cluster_size=cluster_size)
-
-    # Map clusters <-> words
-    cluster_words_map, word_cluster_map = ec.cluster_word_map(clusters)
-
-    print(f"Number of clusters created: {len(clusters)}")
-
-    return ec, clusters, cluster_words_map, word_cluster_map
 
 # Output:
 # - clusters : semantic word clusters
 # - word_cluster_map : tells you which cluster each word belongs to
 # - cluster_words_map : tells you which words are in each cluster
-
-# Note:
-# In this project we only use the essential parts of NeighborFinder and EmbeddingCluster:
-# - NeighborFinder.__init__() to build LSH / brute-force indices
-# - EmbeddingCluster.sequentialcluster() for semantic clustering
-# - cluster_word_map() to map words to clusters
 #
-# Other methods (e.g., eval_index_accuracy, optimize_lsh_hyperparameters,
-# heuristic_cluster, hierarchical_cluster) are advanced or experimental tools
-# that are not needed for the standard textual factors pipeline.
+# Note:
+# We rely on Cong et al.'s NeighborFinder and EmbeddingCluster:
+# - NeighborFinder.__init__() to build LSH / brute-force indices
+# - NeighborFinder.create_lsh_index() for FAISS LSH construction
+# - EmbeddingCluster.sequentialcluster() for semantic clustering
+# - EmbeddingCluster.cluster_word_map() to map words to clusters
+#
+# LSH hyperparameters (N_BITS, N_TABLES) are chosen offline in a
+# separate tuning script using their eval_index_accuracy diagnostics.
+
 
 
 # ============================================================
