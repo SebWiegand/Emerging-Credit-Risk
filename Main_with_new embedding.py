@@ -4,7 +4,6 @@ from itertools import chain  # currently unused, but kept so you recognize it
 import fitz  # PyMuPDF
 import numpy as np
 import pandas as pd
-from gensim.models import Word2Vec
 
 # --- helper functions from engine.py ---
 from engine import (
