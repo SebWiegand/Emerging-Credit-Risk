@@ -23,6 +23,7 @@ from TextualFactors import (
     transfer_topic_importances,
 )
 
+from openai import OpenAI
 # ============================================================
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
@@ -231,9 +232,17 @@ def preprocess_and_count_words(df):
 # 4. CREATE EMBEDDINGS USING OPENAI (REPLACES WORD2VEC)
 # ============================================================
 
-from openai import OpenAI
-client = OpenAI(
-  "keyhere")
+# Read API key from environment variable (set in PyCharm Run Configuration)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+if OPENAI_API_KEY is None:
+    raise RuntimeError(
+        "Missing OPENAI_API_KEY environment variable. "
+        "Set it in Run → Edit Configurations → Environment variables."
+    )
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
 def train_openai_embeddings(df):
     """
     Build word embeddings using OpenAI's text-embedding-3-small model.

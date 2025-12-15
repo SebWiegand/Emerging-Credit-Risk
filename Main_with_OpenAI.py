@@ -6,10 +6,16 @@ import numpy as np
 import pandas as pd
 from openai import OpenAI
 
-client = OpenAI(
-    api_key="ENTERKEYHERE"  # or read from env var in real use
-)
+# Read API key from environment variable (set in PyCharm Run Configuration)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
+if OPENAI_API_KEY is None:
+    raise RuntimeError(
+        "Missing OPENAI_API_KEY environment variable. "
+        "Set it in Run → Edit Configurations → Environment variables."
+    )
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- helper functions from engine.py ---
 from engine import (
@@ -261,13 +267,16 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
 # ============================================================
 
 # ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
-N_BITS = 256    # number of hash bits = hyperplanes per table  (example)
-N_TABLES = 32   # number of hash tables                       (example)
+N_BITS = 128    # number of hash bits = hyperplanes per table  (example)
+N_TABLES = 64   # number of hash tables                       (example)
+
+# Global hyperparameter: number of LSA topics per clustera
+N_TOPICS_PER_CLUSTER = 2
 
 
 def cluster_words(
     embedding_matrix,
-    cluster_size=50,
+    cluster_size=100,
     neighbor_alg="lsh",
 ):
     """

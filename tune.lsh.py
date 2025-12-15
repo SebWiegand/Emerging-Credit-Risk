@@ -48,7 +48,7 @@ print("NeighborFinder initialized.")
 
 # ============================================================
 # 3. Use THEIR hyperparameter optimizer
-# ============================================================
+# ==============================================a==============
 # Note: optimize_lsh_hyperparameters internally:
 #   - loops over bits & tables
 #   - creates LSH indices
