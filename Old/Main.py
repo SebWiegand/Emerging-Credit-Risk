@@ -27,7 +27,7 @@ from TextualFactors import (
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
-# Project root = folder where this Main.py lives
+# Project root = folder where this Main1.py lives
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Folder with your annual reports (the Reports folder in your project)

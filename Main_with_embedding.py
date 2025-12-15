@@ -643,9 +643,6 @@ if __name__ == "__main__":
     main()
 
 
-
-
-
 # Note on unused functions:
 # Several functions in engine.py and TextualFactors.py are not used in this project.
 
@@ -663,4 +660,3 @@ if __name__ == "__main__":
 
 # - Internal TextualFactors helpers (normalization/diagnostics) are not required.
 #   Only the SVD-based lsa_topics() method is needed to construct textual factors from clustered words.
-

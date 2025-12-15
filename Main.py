@@ -140,7 +140,10 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 def build_document_dataframe(report_paragraphs, report_sources):
     """
     Combine all paragraphs belonging to the same file into one document.
-    So each PDF becomes ONE document with all its paragraphs merged.
+    Each PDF becomes ONE document (bank × year).
+
+    Also parses bank and year from the filename so outputs
+    can be merged with bank-year panel data.
     """
 
     df = pd.DataFrame({
@@ -148,10 +151,25 @@ def build_document_dataframe(report_paragraphs, report_sources):
         "content": report_paragraphs,
     })
 
-    # Group all paragraphs from the same file into one big document
-    df_grouped = df.groupby("file")["content"].apply(lambda texts: "\n".join(texts)).reset_index()
+    # Group paragraphs into one document per file
+    df_grouped = df.groupby("file", as_index=False)["content"].apply(
+        lambda texts: "\n".join(texts)
+    )
 
-    # Add document index
+    # Parse year and bank from filenames like:
+    # "2021_Danske_group.pdf" or "2021_Danske_group.pdf.pdf"
+    pattern = r"(?P<year>\d{4})_(?P<bank>.+?)_group\.pdf(?:\.pdf)?"
+    extracted = df_grouped["file"].str.extract(pattern)
+
+    df_grouped["year"] = extracted["year"].astype("Int64")
+    df_grouped["bank"] = extracted["bank"]
+
+    # Sort for reproducible document IDs
+    df_grouped = df_grouped.sort_values(
+        ["year", "bank", "file"]
+    ).reset_index(drop=True)
+
+    # Stable internal document ID
     df_grouped["document"] = np.arange(len(df_grouped))
 
     return df_grouped
@@ -184,6 +202,7 @@ def preprocess_and_count_words(df):
     # 2) Tokenize + count word frequencies.
     #    calculate_word_frequencies expects a text column (default 'text'),
     #    so we tell it to use 'content'.
+    #    Removes stopwords
     df = calculate_word_frequencies(df, text_column="content")
 
     return df
@@ -236,6 +255,8 @@ def train_word2vec(df):
         min_count=5,      # ignore words that appear fewer than 5 times
         workers=4,        # number of CPU cores to use
         sg=1,             # 1 = skip-gram, 0 = CBOW
+        seed= 42,
+        epochs=20,
     )
 
     # Get the learned word vectors
@@ -263,17 +284,14 @@ def train_word2vec(df):
     return w2v_model, vocab, embedding_matrix
 
 
-
-
-
 # ============================================================
 # 5. CLUSTER WORD EMBEDDINGS (NeighborFinder + EmbeddingCluster)
 #    using pre-tuned FAISS LSH parameters
 # ============================================================
 
 # ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
-N_BITS = 128    # number of hash bits = hyperplanes per table  (example)
-N_TABLES = 32   # number of hash tables                       (example)
+N_BITS = 128    # number of hash bits = hyperplanes per table
+N_TABLES = 32   # number of hash tables
 
 
 def cluster_words(
@@ -359,24 +377,22 @@ def cluster_words(
 def build_document_word_data(df, vocab):
     """
     Create a long-format table with:
-    - document (paragraph ID)
+    - document (document ID)
     - ngram (word)
     - count (frequency of the word in that document)
-
-    This is the format expected by TextualFactors.
     """
 
     rows = []
+    vocab_set = set(vocab)
 
-    # df["word_freq"] is a dict: word → count for each paragraph/document
     for doc_id, word_counts in zip(df["document"], df["word_freq"]):
         for word, count in word_counts.items():
-            if word in vocab:  # keep only words that exist in the embedding model
+            if word in vocab_set:
                 rows.append(
                     {
                         "document": doc_id,
                         "ngram": word,
-                        "count": int(count)
+                        "count": int(count),
                     }
                 )
 
@@ -482,6 +498,9 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=2):
 # - topic importance weights
 
 
+# Global hyperparameter: number of LSA topics per cluster
+N_TOPICS_PER_CLUSTER = 2
+
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
@@ -524,7 +543,11 @@ def main():
     print(word_cluster_data.head())
 
     print("\n=== STEP 7: Compute Textual Factors (SVD / LSA) ===")
-    tf_results = compute_textual_factors(document_word_data, word_cluster_data)
+    tf_results = compute_textual_factors(
+        document_word_data,
+        word_cluster_data,
+        n_topics=N_TOPICS_PER_CLUSTER,
+    )
 
     # Create output folder
     out_folder = "outputs_textual_factors"
@@ -544,8 +567,65 @@ def main():
 if __name__ == "__main__":
     main()
 
+# Improvements:
+# - Cluster size:
+#     * Currently cluster_size = 50, which yields ~600 small clusters (≈5–6 words each).
+#     * Possible improvement: run a small sensitivity analysis on cluster_size
+#       (e.g. 30, 50, 80) and see how robust the main TFs are.
+#
+# - Ingestion of documents:
+#     * Filenames must follow the pattern "YYYY_<Bank>_group.pdf" (or .pdf.pdf as now),
+#       because year/bank are parsed from the name.
+#     * page_ranges keys must match the exact filenames in Reports/.
+#       If the naming convention changes, update both the regex in
+#       build_document_dataframe() and the page_ranges dict.
+#
+# - Number of topics per cluster:
+#     * Currently N_TOPICS_PER_CLUSTER = 2 (TF1 + TF2 as a robustness check).
+#     * For the final empirical analysis, consider using only TF1
+#       (set N_TOPICS_PER_CLUSTER = 1) and treat TF2 as diagnostics.
+#
+# - Filtering clusters and topics:
+#     * Not all clusters / topics will be relevant economically.
+#     * After running the pipeline, use topic_importances.csv and singular_values.csv
+#       to filter out weak or noisy components:
+#           - Drop clusters where overall topic_importance is very low.
+#           - Optionally drop TF2 if its singular value is much smaller than TF1
+#             or if the associated words are not interpretable as a clear risk theme.
+#     * This filtering is done downstream (in a separate analysis script / notebook),
+#       but it is an explicit modelling choice and should be documented in the thesis.
 
 
+# Manual modelling settings / hyperparameters:
+# - Sample design:
+#     * Which banks and years are included (which PDFs in Reports/)
+#     * Which pages per PDF (page_ranges, default_pages)
+#     * Specific fil name
+#
+# - Text preprocessing (engine.py):
+#     * Stopword list (English)
+#     * Lemmatization (WordNetLemmatizer)
+#     * Removal of digits and punctuation
+#     * Currently unigrams only (no bigrams yet)
+#
+# - Word2Vec:
+#     * vector_size = 300
+#     * window = 5
+#     * min_count = 5
+#     * sg = 1 (skip-gram)
+#     * epochs = 20
+#     * seed = 42
+#
+# - Neighbor search / LSH:
+#     * neighbor_alg = "lsh" (vs "brutal")
+#     * N_BITS = 128, N_TABLES = 32  (LSH hyperparameters)
+#
+# - Clustering:
+#     * cluster_size = 50  (target max words per cluster – implies number of clusters)
+#
+# - Textual factors (SVD / LSA):
+#     * cluster_type = "sequential_cluster"
+#     * n_topics = 2 per cluster (TF1 and TF2; TF2 mainly as robustness check)
 
 
 # Note on unused functions:
