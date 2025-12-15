@@ -32,8 +32,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Folder with your annual reports (the Reports folder in your project)
 reports_folder = os.path.join(PROJECT_ROOT, "Reports")
-# If you prefer, you can hard-code:
-# reports_folder = "/Users/sebastianwiegandmoller/PycharmProjects/Emerging-Credit-Risk/Reports"
+
 
 # Your own page_ranges (copied from your notebook)
 page_ranges = {
