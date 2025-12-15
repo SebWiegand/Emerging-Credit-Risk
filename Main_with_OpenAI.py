@@ -5,9 +5,10 @@ import fitz  # PyMuPDF
 import numpy as np
 import pandas as pd
 from openai import OpenAI
-from openai import OpenAI
+
 client = OpenAI(
-  "ENTERKEYHERE")
+    api_key="ENTERKEYHERE"  # or read from env var in real use
+)
 
 
 # --- helper functions from engine.py ---
