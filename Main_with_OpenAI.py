@@ -511,6 +511,12 @@ def main():
     print("\n=== STEP 3: Clean text + tokenize + count words ===")
     df_docs = preprocess_and_count_words(df_docs)
 
+    df_docs = df_docs[df_docs["tokens"].apply(len) >= 5].copy()
+
+    print("Example cleaned document:", df_docs["content"].iloc[0][:200])
+    print("Example tokens:", df_docs["tokens"].iloc[0][:20])
+
+
     print("\n=== STEP 4: Create OpenAI Embeddings ===")
     vocab, embedding_matrix = train_openai_embeddings(df_paragraphs)
     print(f"Vocabulary size: {len(vocab)}")
@@ -588,7 +594,9 @@ if __name__ == "__main__":
 # - Sample design:
 #     * Which banks and years are included (which PDFs in Reports/)
 #     * Which pages per PDF (page_ranges, default_pages)
-#     * Specific fil name
+#     * Filename convention for parsing identifiers:
+#         - Expected: "YYYY_<Bank>_group.pdf" (or ".pdf.pdf" variants)
+#         - Parsed fields: year, bank (used for bank-year panel merges)
 #
 # - Text preprocessing (engine.py):
 #     * Stopword list (English)
@@ -596,21 +604,30 @@ if __name__ == "__main__":
 #     * Removal of digits and punctuation
 #     * Currently unigrams only (no bigrams yet)
 #
+# - Token quality filter (main pipeline):
+#     * Report-level documents are filtered after cleaning
+#     * Current rule: keep only documents where len(tokens) >= 5
+#     * Motivation: some PDF content (tables/headers) can be cleaned to empty/near-empty text
+#
 # - Embeddings (OpenAI):
 #     * model_name = "text-embedding-3-small"
-#     * Vocabulary built from cleaned tokens across all paragraphs
+#     * Vocabulary built from cleaned tokens across all paragraphs (df_paragraphs)
 #     * Embeddings retrieved via OpenAI API (no local training hyperparameters)
+#     * Batch size for embedding calls: batch_size = 500
 #
 # - Neighbor search / LSH:
 #     * neighbor_alg = "lsh" (vs "brutal")
-#     * N_BITS = 128, N_TABLES = 32  (LSH hyperparameters)
+#     * N_BITS = 128, N_TABLES = 64  (FAISS LSH hyperparameters; should match tune_lsh.py output)
+#     * random_state = 42, num_queries = 1000 (NeighborFinder diagnostics)
 #
 # - Clustering:
-#     * cluster_size = 50  (target max words per cluster – implies number of clusters)
+#     * Sequential clustering (Cong et al.)
+#     * cluster_size = 50 (target words per cluster; affects number of clusters)
 #
 # - Textual factors (SVD / LSA):
 #     * cluster_type = "sequential_cluster"
-#     * n_topics = 2 per cluster (TF1 and TF2; TF2 mainly as robustness check)
+#     * N_TOPICS_PER_CLUSTER = 2 (TF1 and TF2; TF2 mainly as robustness check)
+
 
 
 # Note on unused functions:

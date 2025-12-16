@@ -519,8 +519,13 @@ def main():
 
     print("\n=== STEP 3: Clean text + tokenize + count words ===")
     df_docs = preprocess_and_count_words(df_docs)
-    print("Example cleaned document:", df_docs['content'].iloc[0][:200])
-    print("Example tokens:", df_docs['tokens'].iloc[0][:20])
+
+    # Token quality filter (after cleaning): drop documents with very short token lists
+    df_docs = df_docs[df_docs["tokens"].apply(len) >= 5].copy()
+    print(f"Documents after token filter (>=5): {len(df_docs)}")
+
+    print("Example cleaned document:", df_docs["content"].iloc[0][:200])
+    print("Example tokens:", df_docs["tokens"].iloc[0][:20])
 
     print("\n=== STEP 4: Train Word2Vec ===")
     w2v_model, vocab, embedding_matrix = train_word2vec(df_docs)
@@ -593,19 +598,36 @@ if __name__ == "__main__":
 #             or if the associated words are not interpretable as a clear risk theme.
 #     * This filtering is done downstream (in a separate analysis script / notebook),
 #       but it is an explicit modelling choice and should be documented in the thesis.
+#     * Drop words that are not relevant for the cluster
+#
+# - Embedding caching (optional improvement):
+#     * Word embeddings (e.g. Word2Vec or OpenAI embeddings) can be cached to disk
+#       (e.g. as a pickle file or embeddings_cache.parquet)
+#     * Avoids recomputing embeddings when iterating on clustering, LSH, or TF settings
+#     * Particularly useful when using API-based embeddings with cost or rate limits
+#     * Cache should be invalidated manually if:
+#           - preprocessing changes (stopwords, lemmatization, token filters)
+#           - document sample or page ranges change
+#           - embedding model or parameters change
+#     * Not implemented by default since current runtime is fast enough
 
 
 # Manual modelling settings / hyperparameters:
 # - Sample design:
 #     * Which banks and years are included (which PDFs in Reports/)
 #     * Which pages per PDF (page_ranges, default_pages)
-#     * Specific fil name
+#     * Filename convention: "YYYY_<Bank>_group.pdf" (or ".pdf.pdf" variants) used to parse year and bank
 #
 # - Text preprocessing (engine.py):
 #     * Stopword list (English)
 #     * Lemmatization (WordNetLemmatizer)
 #     * Removal of digits and punctuation
 #     * Currently unigrams only (no bigrams yet)
+#
+# - Token quality filter (main pipeline):
+#     * Report-level documents are filtered after cleaning
+#     * Current rule: keep only documents where len(tokens) >= 5
+#     * Motivation: some PDF content (tables/headers) can be cleaned to empty/near-empty text
 #
 # - Word2Vec:
 #     * vector_size = 300
