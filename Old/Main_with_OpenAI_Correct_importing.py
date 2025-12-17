@@ -255,7 +255,7 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
         print(f"Processed batch {i//batch_size + 1}")
 
     embedding_matrix = np.array(embeddings, dtype=np.float32)
-    np.save("../embedding_matrix.npy", embedding_matrix)
+    np.save("../Text analytics/embedding_matrix.npy", embedding_matrix)
     print("Saved embedding_matrix.npy in:", os.getcwd())
     return vocab, embedding_matrix
 
