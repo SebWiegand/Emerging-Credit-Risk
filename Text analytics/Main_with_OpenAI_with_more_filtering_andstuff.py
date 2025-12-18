@@ -7,6 +7,9 @@ import pandas as pd
 from collections import Counter
 from openai import OpenAI
 
+import ast
+import re
+
 # Read API key from environment variable (set in PyCharm Run Configuration)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
@@ -586,6 +589,241 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=1):
 
 
 # ============================================================
+# 7B. EXPORT TOP-20 SUMMARIES (TOP CLUSTERS, TOP WORDS, TOP LOADINGS)
+# ============================================================
+
+def _pick_first_existing_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _pick_first_numeric_col(df, exclude_cols=None, prefer_substr=None):
+    exclude_cols = set(exclude_cols or [])
+    num_cols = [c for c in df.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df[c])]
+    if not num_cols:
+        return None
+    if prefer_substr:
+        for c in num_cols:
+            if prefer_substr in c.lower():
+                return c
+    return num_cols[0]
+
+
+def _load_first_doc_topics_as_long(path_csv):
+    """
+    Supports BOTH formats:
+    (A) Long:  columns like [cluster_id, document, topic_loading]
+    (B) Wide:  columns like [document, topic_loading_0, topic_loading_1, ...]
+    Returns long df with columns: cluster_id, document, topic_loading
+    """
+    df = pd.read_csv(path_csv)
+
+    # Long format already?
+    if "cluster_id" in df.columns and "document" in df.columns and "topic_loading" in df.columns:
+        return df[["cluster_id", "document", "topic_loading"]].copy()
+
+    # Wide format: melt topic_loading_{cluster}
+    if "document" not in df.columns:
+        raise RuntimeError(f"first_doc_topics.csv has no 'document' column. Found columns: {list(df.columns)}")
+
+    topic_cols = [c for c in df.columns if c.startswith("topic_loading_")]
+    if not topic_cols:
+        raise RuntimeError(
+            "Could not find topic loading columns in first_doc_topics.csv. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    long_df = df.melt(
+        id_vars=["document"],
+        value_vars=topic_cols,
+        var_name="cluster_id",
+        value_name="topic_loading",
+    )
+    long_df["cluster_id"] = long_df["cluster_id"].str.replace("topic_loading_", "", regex=False)
+    long_df["cluster_id"] = pd.to_numeric(long_df["cluster_id"], errors="coerce")
+    long_df = long_df.dropna(subset=["cluster_id"]).copy()
+    long_df["cluster_id"] = long_df["cluster_id"].astype(int)
+
+    return long_df[["cluster_id", "document", "topic_loading"]]
+
+
+def _topics_words_to_long(tw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize topics_words output to a long DataFrame with columns:
+      - cluster_id
+      - word
+      - word_loading
+
+    Supports two formats:
+      (A) already-long with cluster/word/loading columns
+      (B) compact format with columns: ['topic', 'topic_distribution'] where
+          topic_distribution is a stringified list of (word, loading) pairs.
+    """
+
+    # Case B: compact format from transfer_topic_words
+    if "topic" in tw.columns and "topic_distribution" in tw.columns and len(tw.columns) == 2:
+        rows = []
+        for _, r in tw.iterrows():
+            topic = r["topic"]
+
+            # Extract numeric cluster id from topic (handles int, '12', 'cluster_12', etc.)
+            cluster_id = None
+            if pd.isna(topic):
+                continue
+            if isinstance(topic, (int, np.integer)):
+                cluster_id = int(topic)
+            else:
+                s = str(topic)
+                m = re.search(r"\d+", s)
+                if m:
+                    cluster_id = int(m.group())
+            if cluster_id is None:
+                continue
+
+            dist = r["topic_distribution"]
+            if pd.isna(dist):
+                continue
+
+            # Parse distribution into iterable of (word, loading)
+            parsed = None
+            if isinstance(dist, str):
+                try:
+                    parsed = ast.literal_eval(dist)
+                except Exception:
+                    parsed = None
+            else:
+                parsed = dist
+
+            if parsed is None:
+                continue
+
+            if isinstance(parsed, dict):
+                items = parsed.items()
+            else:
+                items = parsed
+
+            for item in items:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                word = item[0]
+                try:
+                    loading = float(item[1])
+                except Exception:
+                    continue
+                rows.append({
+                    "cluster_id": cluster_id,
+                    "word": str(word),
+                    "word_loading": loading,
+                })
+
+        return pd.DataFrame(rows, columns=["cluster_id", "word", "word_loading"])
+
+    # Case A: already-long format (try to detect common column names)
+    tw_cluster_col = _pick_first_existing_col(tw, ["cluster_id", "sequential_cluster", "cluster"])
+    word_col = _pick_first_existing_col(tw, ["ngram", "word", "token", "term"])
+    loading_col = _pick_first_numeric_col(tw, exclude_cols=[c for c in [tw_cluster_col] if c], prefer_substr="loading")
+    if loading_col is None:
+        loading_col = _pick_first_numeric_col(tw, exclude_cols=[c for c in [tw_cluster_col] if c], prefer_substr="weight")
+
+    if tw_cluster_col and word_col and loading_col:
+        out = tw[[tw_cluster_col, word_col, loading_col]].copy()
+        out = out.rename(columns={tw_cluster_col: "cluster_id", word_col: "word", loading_col: "word_loading"})
+        out["cluster_id"] = pd.to_numeric(out["cluster_id"], errors="coerce")
+        out = out.dropna(subset=["cluster_id"]).copy()
+        out["cluster_id"] = out["cluster_id"].astype(int)
+        out["word_loading"] = pd.to_numeric(out["word_loading"], errors="coerce")
+        out = out.dropna(subset=["word_loading"]).copy()
+        return out[["cluster_id", "word", "word_loading"]]
+
+    raise RuntimeError(
+        "Could not normalize topics_words to long format. "
+        f"Found columns: {list(tw.columns)}"
+    )
+
+
+def export_top20_summaries(out_folder="outputs_textual_factors", top_n=20, top_words_per_cluster=20):
+    """
+    Writes four CSVs into out_folder:
+      1) top20_topic_importances.csv
+      2) top20_first_doc_topics.csv          (top |loading| rows among top clusters)
+      3) top20_words_per_top_cluster.csv     (top words per cluster by |word_loading|)
+      4) top20_topic_words_overall.csv       (top words overall across top clusters)
+
+    Robust to wide vs long first_doc_topics format.
+    """
+    imp_path = os.path.join(out_folder, "topic_importances.csv")
+    words_path = os.path.join(out_folder, "topics_words.csv")
+    doc_path = os.path.join(out_folder, "first_doc_topics.csv")
+
+    if not (os.path.exists(imp_path) and os.path.exists(words_path) and os.path.exists(doc_path)):
+        print("[export_top20_summaries] Skipping: required CSVs not found in", out_folder)
+        return
+
+    # ----------------------
+    # 1) Topic importances
+    # ----------------------
+    imp = pd.read_csv(imp_path)
+
+    cluster_col = _pick_first_existing_col(imp, ["cluster_id", "sequential_cluster", "cluster"])
+    if cluster_col is None:
+        cluster_col = imp.columns[0]  # fallback
+
+    importance_col = _pick_first_numeric_col(imp, exclude_cols=[cluster_col], prefer_substr="importance")
+    if importance_col is None:
+        raise RuntimeError(
+            f"Could not find a numeric importance column in {imp_path}. Found columns: {list(imp.columns)}"
+        )
+
+    imp_small = imp[[cluster_col, importance_col]].copy()
+    imp_small = imp_small.rename(columns={cluster_col: "cluster_id", importance_col: "topic_importance"})
+    imp_small["cluster_id"] = pd.to_numeric(imp_small["cluster_id"], errors="coerce")
+    imp_small = imp_small.dropna(subset=["cluster_id"]).copy()
+    imp_small["cluster_id"] = imp_small["cluster_id"].astype(int)
+
+    top_imp = imp_small.sort_values("topic_importance", ascending=False).head(top_n)
+    top_imp.to_csv(os.path.join(out_folder, "top20_topic_importances.csv"), index=False)
+    top_clusters = top_imp["cluster_id"].tolist()
+
+    # ----------------------
+    # 2) First doc topics (TF1 loadings)
+    # ----------------------
+    doc_long = _load_first_doc_topics_as_long(doc_path)
+    doc_long = doc_long[doc_long["cluster_id"].isin(top_clusters)].copy()
+
+    doc_long["abs_loading"] = doc_long["topic_loading"].abs()
+    top_doc = doc_long.sort_values("abs_loading", ascending=False).head(top_n).drop(columns=["abs_loading"])
+    top_doc.to_csv(os.path.join(out_folder, "top20_first_doc_topics.csv"), index=False)
+
+    # ----------------------
+    # 3) Topic words (TF1 word loadings)
+    # ----------------------
+    tw_raw = pd.read_csv(words_path)
+    tw_small = _topics_words_to_long(tw_raw)
+
+    tw_top = tw_small[tw_small["cluster_id"].isin(top_clusters)].copy()
+    tw_top["abs_word_loading"] = tw_top["word_loading"].abs()
+
+    # (a) Top words per top cluster
+    rows = []
+    for cid in top_clusters:
+        sub = tw_top[tw_top["cluster_id"] == cid].sort_values("abs_word_loading", ascending=False)
+        rows.append(sub.head(top_words_per_cluster))
+    top_words_per_cluster_df = (
+        pd.concat(rows, ignore_index=True).drop(columns=["abs_word_loading"])
+        if rows else
+        pd.DataFrame(columns=["cluster_id", "word", "word_loading"])
+    )
+    top_words_per_cluster_df.to_csv(os.path.join(out_folder, "top20_words_per_top_cluster.csv"), index=False)
+
+    # (b) Top words overall across top clusters
+    top_words_overall = tw_top.sort_values("abs_word_loading", ascending=False).head(top_n).drop(columns=["abs_word_loading"])
+    top_words_overall.to_csv(os.path.join(out_folder, "top20_topic_words_overall.csv"), index=False)
+
+    print(f"[export_top20_summaries] Wrote top-20 summaries to: {out_folder} (clusters={len(top_clusters)})")
+
+# ============================================================
 # MAIN PIPELINE
 # ============================================================
 
@@ -667,6 +905,7 @@ def main():
     tf_results["topics_words_df"].to_csv(f"{out_folder}/topics_words.csv", index=False)
     tf_results["singular_values_df"].to_csv(f"{out_folder}/singular_values.csv", index=False)
     tf_results["topic_importances_df"].to_csv(f"{out_folder}/topic_importances.csv", index=False)
+    export_top20_summaries(out_folder=out_folder)
 
     print("\nPipeline finished ✓")
     print("Outputs written to:", out_folder)
