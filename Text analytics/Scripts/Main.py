@@ -277,7 +277,7 @@ def train_word2vec(df):
     # ------------------------------------------------------------
     # SAVE embedding_matrix so tune_lsh.py can load it
     # ------------------------------------------------------------
-    np.save("../embedding_matrix.npy", embedding_matrix)
+    np.save("../Noter/embedding_matrix.npy", embedding_matrix)
     print("Saved embedding_matrix.npy in:", os.getcwd())
     return w2v_model, vocab, embedding_matrix
 

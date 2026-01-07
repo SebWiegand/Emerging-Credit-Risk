@@ -1,0 +1,62 @@
+1️⃣ first_doc_topics.csv
+
+What it shows:
+This file contains the document-level loadings of each bank–year annual report on the first textual factor (TF1) within each semantic word cluster. Each observation represents a bank–year document, and each column represents a cluster-specific TF1 score.
+
+How it is calculated:
+For each cluster, a document–word frequency matrix is constructed and decomposed using Singular Value Decomposition (SVD). The TF1 loading corresponds to the first left-singular vector, capturing the dominant latent theme in the cluster for each document.
+
+What it is used for:
+These TF1 loadings form the main explanatory variables in downstream empirical analysis, such as panel regressions linking textual risk themes to bank-level outcomes (e.g. capital ratios, risk measures, or market responses).
+
+⸻
+
+2️⃣ second_doc_topics.csv (only when n_topics = 2)
+
+What it shows:
+This file reports document-level loadings on the second textual factor (TF2) within each cluster. TF2 captures variation that is orthogonal to the dominant theme represented by TF1.
+
+How it is calculated:
+TF2 corresponds to the second left-singular vector obtained from the SVD of the cluster-specific document–word matrix. It reflects secondary or residual variation within the cluster.
+
+What it is used for:
+TF2 is primarily used for robustness checks and diagnostics, for example to test whether results are driven by a single dominant theme or by more diffuse textual variation. In many applications, TF2 is dropped if it lacks clear economic interpretation.
+
+⸻
+
+3️⃣ topics_words.csv
+
+What it shows:
+This file lists the words associated with each cluster-level textual factor, together with their factor loadings. It provides a transparent mapping between latent factors and economically interpretable language.
+
+How it is calculated:
+The word loadings are taken from the right-singular vectors of the SVD performed within each cluster. Words with larger absolute loadings contribute more strongly to defining the cluster’s latent theme.
+
+What it is used for:
+This output is used to label and interpret clusters, identify economically meaningful risk themes (e.g. credit risk, capital adequacy, regulation), and to manually or algorithmically filter out semantically irrelevant words.
+
+⸻
+
+4️⃣ singular_values.csv
+
+What it shows:
+This file reports the singular values associated with each textual factor and cluster. Singular values quantify how much variation in document-level word usage is explained by each factor.
+
+How it is calculated:
+Singular values are produced directly by the SVD of each cluster-specific document–word matrix. Larger values indicate stronger common structure across documents within a cluster.
+
+What it is used for:
+Singular values are used to assess factor strength, justify retaining TF1 over TF2, and to support formal or informal thresholds for discarding weak or noisy textual factors.
+
+⸻
+
+5️⃣ topic_importances.csv
+
+What it shows:
+This file provides a relative importance measure for each cluster-level textual factor, indicating its contribution to overall textual variation across the full corpus of annual reports.
+
+How it is calculated:
+Topic importance is computed as the squared first singular value of a cluster divided by the sum of squared first singular values across all clusters. This normalization yields a comparable importance score across clusters.
+
+What it is used for:
+Topic importance is used to rank and filter clusters, retain economically relevant risk themes, and reduce dimensionality before regression analysis. Clusters with very low importance can be excluded without materially affecting empirical results.

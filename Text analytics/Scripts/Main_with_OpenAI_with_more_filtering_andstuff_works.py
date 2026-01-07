@@ -1,4 +1,26 @@
 import os
+import sys
+import nltk
+
+# ------------------------------------------------------------
+# Directions
+# ------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../Text analytics/Scripts
+TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
+NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
+CONG_REP_DIR = os.path.join(TEXT_ANALYTICS_DIR, "Cong et al. rep")      # .../Text analytics/Cong et al. rep
+NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
+nltk.data.path = [NLTK_DATA_DIR]
+
+
+
+
+
+for p in (CONG_REP_DIR, TEXT_ANALYTICS_DIR, SCRIPT_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
 from itertools import chain  # currently unused, but kept so you recognize it
 
 import fitz  # PyMuPDF
@@ -39,13 +61,14 @@ from TextualFactors import (
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
-# Project root = folder where this Main_V1.py lives
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+#
+# This script lives in: <repo>/Text analytics/Scripts/
+# Reports live in:      <repo>/Text analytics/Reports/
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)  # <repo>/Text analytics
 
-# Folder with your annual reports (the Reports folder in your project)
-reports_folder = os.path.join(PROJECT_ROOT, "Reports")
-# If you prefer, you can hard-code:
-# reports_folder = "/Users/sebastianwiegandmoller/PycharmProjects/Emerging-Credit-Risk/Reports"
+reports_folder = os.path.join(TEXT_ANALYTICS_DIR, "Reports")
+print("Reports folder:", reports_folder)
 
 # Your own page_ranges (copied from your notebook)
 page_ranges = {
@@ -257,10 +280,10 @@ def build_document_dataframe(report_paragraphs, report_sources):
         "content": report_paragraphs,
     })
 
-    # Group paragraphs into one document per file
-    df_grouped = df.groupby("file", as_index=False)["content"].apply(
-        lambda texts: "\n".join(texts)
-    )
+    # Group paragraphs into one document per file (robust: always returns a DataFrame)
+    df_grouped = df.groupby("file", as_index=False).agg({"content": lambda texts: "\n".join(texts)})
+    if df_grouped.empty:
+        return pd.DataFrame(columns=["file", "content", "year", "bank", "document"])
 
     # Parse year and bank from filenames like:
     # "2021_Danske_group.pdf" or "2021_Danske_group.pdf.pdf"
@@ -350,8 +373,14 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
         print(f"Processed batch {i//batch_size + 1}")
 
     embedding_matrix = np.array(embeddings, dtype=np.float32)
-    np.save("../embedding_matrix.npy", embedding_matrix)
-    print("Saved embedding_matrix.npy in:", os.getcwd())
+
+    # Save embeddings next to the repo in a stable location
+    out_dir = os.path.join(TEXT_ANALYTICS_DIR, "Noter")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "embedding_matrix.npy")
+    np.save(out_path, embedding_matrix)
+    print("Saved embedding_matrix.npy to:", out_path)
+
     return vocab, embedding_matrix
 
 
@@ -597,6 +626,10 @@ def main():
         default_pages
     )
     print(f"Loaded {len(report_paragraphs)} paragraphs")
+    if len(report_paragraphs) == 0:
+        raise RuntimeError(
+            f"Loaded 0 paragraphs. Check PDFs exist in: {reports_folder} and filenames match page_ranges keys."
+        )
 
     # === NEW STEP 2A: Build paragraph-level DataFrame for Word2Vec ===
     df_paragraphs = pd.DataFrame({
