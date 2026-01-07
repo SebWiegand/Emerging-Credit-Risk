@@ -1,21 +1,7 @@
 import os
-from itertools import chain  # currently unused, but kept so you recognize it
 
 import fitz  # PyMuPDF
-import numpy as np
-import pandas as pd
-from openai import OpenAI
-
-# Read API key from environment variable (set in PyCharm Run Configuration)
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-
-if OPENAI_API_KEY is None:
-    raise RuntimeError(
-        "Missing OPENAI_API_KEY environment variable. "
-        "Set it in Run → Edit Configurations → Environment variables."
-    )
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+from gensim.models import Word2Vec
 
 # --- helper functions from engine.py ---
 from engine import (
@@ -38,7 +24,7 @@ from TextualFactors import (
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
-# Project root = folder where this Main_V1.py lives
+# Project root = folder where this Main_with incorporating a way get factor loadings.py lives
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Folder with your annual reports (the Reports folder in your project)
@@ -109,7 +95,7 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 
                 # If None -> all pages
                 if pages_to_process is None:
-                    pages_to_process = range(total_pages )
+                    pages_to_process = range(total_pages)
 
                 # Handle possible negative page indices
                 actual_pages = []
@@ -136,7 +122,7 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 
     return report_paragraphs, report_paragraphs_source, report_pages_source
 
-
+# Output
 # Output:
 # After this section we have three parallel lists:
 # 1) report_paragraphs        -> all extracted text paragraphs (strings)
@@ -148,42 +134,52 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 # 2. BUILD DOCUMENT DATAFRAME
 # ============================================================
 
-def build_document_dataframe(report_paragraphs, report_sources):
-    """
-    Combine all paragraphs belonging to the same file into one document.
-    Each PDF becomes ONE document (bank × year).
+import numpy as np
+import pandas as pd
 
-    Also parses bank and year from the filename so outputs
-    can be merged with bank-year panel data.
+def build_document_dataframes(report_paragraphs, report_sources, report_pages):
+    """
+    Build two DataFrames:
+
+    1) df_paragraphs: one row per paragraph (good for Word2Vec + LSH)
+       - paragraph_id, content, file, page
+
+    2) df_reports: one row per annual report (good for TF loadings / regressions)
+       - document (0..num_reports-1), content (full report text),
+         file, year, bank
     """
 
-    df = pd.DataFrame({
-        "file": report_sources,
+    # -----------------------------
+    # A. Paragraph-level dataframe
+    # -----------------------------
+    df_paragraphs = pd.DataFrame({
+        "paragraph_id": np.arange(len(report_paragraphs)),
         "content": report_paragraphs,
+        "file": report_sources,
+        "page": report_pages,
     })
 
-    # Group paragraphs into one document per file
-    df_grouped = df.groupby("file", as_index=False)["content"].apply(
-        lambda texts: "\n".join(texts)
+    df_paragraphs["file"] = df_paragraphs["file"].astype(str)
+
+    # -----------------------------
+    # B. Annual-report-level dataframe
+    # -----------------------------
+    combined = (
+        df_paragraphs
+        .groupby("file")["content"]
+        .apply(lambda x: "\n".join(x))
+        .reset_index()
     )
 
-    # Parse year and bank from filenames like:
-    # "2021_Danske_group.pdf" or "2021_Danske_group.pdf.pdf"
-    pattern = r"(?P<year>\d{4})_(?P<bank>.+?)_group\.pdf(?:\.pdf)?"
-    extracted = df_grouped["file"].str.extract(pattern)
+    combined["document"] = combined.index
 
-    df_grouped["year"] = extracted["year"].astype("Int64")
-    df_grouped["bank"] = extracted["bank"]
+    combined["year"] = combined["file"].str.extract(r"(^\d{4})", expand=False)
+    combined["bank"] = combined["file"].str.extract(r"^\d{4}_(.*?)_", expand=False)
 
-    # Sort for reproducible document IDs
-    df_grouped = df_grouped.sort_values(
-        ["year", "bank", "file"]
-    ).reset_index(drop=True)
+    df_reports = combined[["document", "content", "file", "year", "bank"]]
 
-    # Stable internal document ID
-    df_grouped["document"] = np.arange(len(df_grouped))
+    return df_paragraphs, df_reports
 
-    return df_grouped
 
 # Output:
 # df with columns:
@@ -228,37 +224,68 @@ def preprocess_and_count_words(df):
 # but our documents are grouped by bank-year, not by calendar dates, so these functions are not needed here.
 
 
-
 # ============================================================
-# 4. OPENAI EMBEDDING FUNCTION
+# 4. TRAIN WORD2VEC ON CLEANED TOKENS
 # ============================================================
 
-def train_openai_embeddings(df, model_name="text-embedding-3-small"):
+def train_word2vec(df):
     """
-    Build word embeddings using OpenAI's embedding API.
-    Trains on paragraph-level tokens.
+    Train a Word2Vec model on the tokenized documents.
+
+    Input:
+    - df : DataFrame with a 'tokens' column
+           (each row is a list of words for one document)
+
+    Output:
+    - w2v_model       : the trained gensim Word2Vec model
+    - vocab           : list of words in the vocabulary
+    - embedding_matrix: numpy array of shape (V, D),
+                        where V = vocab size, D = embedding dimension
     """
-    vocab = sorted(set(chain.from_iterable(df["tokens"].tolist())))
-    print(f"Vocabulary size: {len(vocab)} words")
 
-    batch_size = 500
-    embeddings = []
+    # df['tokens'] is a list of tokens per document
+    tokenized_docs = df["tokens"].tolist()
 
-    for i in range(0, len(vocab), batch_size):
-        batch = vocab[i:i+batch_size]
-        response = client.embeddings.create(
-            model=model_name,
-            input=batch
-        )
-        batch_embs = [item.embedding for item in response.data]
-        embeddings.extend(batch_embs)
-        print(f"Processed batch {i//batch_size + 1}")
+    print("Number of documents going into Word2Vec:", len(tokenized_docs))
+    if tokenized_docs:
+        print("Example doc tokens:", tokenized_docs[0][:20])
 
-    embedding_matrix = np.array(embeddings, dtype=np.float32)
+    if len(tokenized_docs) == 0:
+        raise RuntimeError("No documents available for Word2Vec training.")
+
+    # ------------------------------------------------------------
+    # Train the Word2Vec model
+    # ------------------------------------------------------------
+    w2v_model = Word2Vec(
+        sentences=tokenized_docs,
+        vector_size=100,   # embedding dimension
+        window=5,          # context window size
+        min_count=5,       # ignore rare words
+        workers=4,         # CPU cores
+        sg=1,              # skip-gram model
+    )
+
+    # Extract vocabulary and vectors
+    word_vectors = w2v_model.wv
+    vocab = list(word_vectors.key_to_index.keys())
+    embedding_dim = word_vectors.vector_size
+
+    # ------------------------------------------------------------
+    # Build embedding matrix aligned to vocabulary
+    # ------------------------------------------------------------
+    embedding_matrix = np.zeros((len(vocab), embedding_dim), dtype=np.float32)
+    for i, w in enumerate(vocab):
+        embedding_matrix[i, :] = word_vectors[w]
+
+    print(f"Trained Word2Vec: {len(vocab)} words, dim={embedding_dim}")
+
+    # ------------------------------------------------------------
+    # SAVE embedding_matrix so tune_lsh.py can load it
+    # ------------------------------------------------------------
     np.save("embedding_matrix.npy", embedding_matrix)
     print("Saved embedding_matrix.npy in:", os.getcwd())
-    return vocab, embedding_matrix
 
+    return w2v_model, vocab, embedding_matrix
 
 
 # ============================================================
@@ -268,15 +295,12 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
 
 # ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
 N_BITS = 128    # number of hash bits = hyperplanes per table  (example)
-N_TABLES = 64   # number of hash tables                       (example)
-
-# Global hyperparameter: number of LSA topics per clustera
-N_TOPICS_PER_CLUSTER = 2
+N_TABLES = 16   # number of hash tables                       (example)
 
 
 def cluster_words(
     embedding_matrix,
-    cluster_size=100,
+    cluster_size=50,
     neighbor_alg="lsh",
 ):
     """
@@ -349,7 +373,6 @@ def cluster_words(
 
 
 
-
 # ============================================================
 # 6. BUILD DOCUMENT-WORD AND WORD-CLUSTER DATA FOR TEXTUAL FACTORS
 # ============================================================
@@ -357,7 +380,7 @@ def cluster_words(
 def build_document_word_data(df, vocab):
     """
     Create a long-format table with:
-    - document (document ID)
+    - document (paragraph ID)
     - ngram (word)
     - count (frequency of the word in that document)
 
@@ -365,17 +388,16 @@ def build_document_word_data(df, vocab):
     """
 
     rows = []
-    vocab_set = set(vocab)
 
-    # df["word_freq"] is a dict: word → count for each document
+    # df["word_freq"] is a dict: word → count for each paragraph/document
     for doc_id, word_counts in zip(df["document"], df["word_freq"]):
         for word, count in word_counts.items():
-            if word in vocab_set:  # keep only words that exist in the embedding model
+            if word in vocab:  # keep only words that exist in the embedding model
                 rows.append(
                     {
                         "document": doc_id,
                         "ngram": word,
-                        "count": int(count),
+                        "count": int(count)
                     }
                 )
 
@@ -387,7 +409,6 @@ def build_document_word_data(df, vocab):
     )
 
     return doc_word_df
-
 
 
 def build_word_cluster_data(vocab, word_cluster_map):
@@ -481,161 +502,6 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=2):
 # - singular values from SVD
 # - topic importance weights
 
-# ============================================================
-# 8. FILTER TEXTUAL FACTORS USING IMPORTANCE AND SINGULAR VALUES
-# ============================================================
-
-def filter_textual_factors(
-    out_folder: str,
-    importance_quantile: float = 0.75,
-    ratio_cutoff: float = 0.2,
-):
-    """
-    Downstream filtering of clusters/topics based on:
-      1) Topic importance (from topic_importances.csv)
-      2) Singular values (from singular_values.csv)
-
-    Steps:
-    - Load:
-        * topic_importances.csv
-        * singular_values.csv
-        * first_doc_topics.csv
-        * second_doc_topics.csv
-        * topics_words.csv
-    - Compute:
-        * importance_cutoff = quantile of leading importance
-        * second_to_first_ratio = σ2 / σ1
-    - Keep:
-        * Clusters in the upper tail of leading importance
-        * Optionally, TF2 only where σ2/σ1 >= ratio_cutoff
-    - Save filtered versions:
-        * first_doc_topics_filtered.csv
-        * second_doc_topics_filtered.csv
-        * topics_words_filtered.csv
-        * topic_metrics_with_ratios.csv  (for diagnostics)
-    """
-
-    # --------------------------------------------------------
-    # 1. Paths
-    # --------------------------------------------------------
-    topic_importances_path = os.path.join(out_folder, "topic_importances.csv")
-    singular_values_path   = os.path.join(out_folder, "singular_values.csv")
-    first_doc_topics_path  = os.path.join(out_folder, "first_doc_topics.csv")
-    second_doc_topics_path = os.path.join(out_folder, "second_doc_topics.csv")
-    topics_words_path      = os.path.join(out_folder, "topics_words.csv")
-
-    # --------------------------------------------------------
-    # 2. Load data
-    # --------------------------------------------------------
-    ti = pd.read_csv(topic_importances_path)
-    sv = pd.read_csv(singular_values_path)
-    fd = pd.read_csv(first_doc_topics_path)
-    sd = pd.read_csv(second_doc_topics_path)
-    tw = pd.read_csv(topics_words_path)
-
-    # --------------------------------------------------------
-    # 3. Detect column names generically
-    #    (so we are robust to different naming conventions)
-    # --------------------------------------------------------
-    # Topic importance: assume 1+ columns besides 'cluster'
-    imp_cols = [c for c in ti.columns if c != "cluster"]
-    if not imp_cols:
-        raise RuntimeError("topic_importances.csv has no importance columns besides 'cluster'.")
-    leading_imp_col = imp_cols[0]  # use first importance column as 'leading'
-
-    # Singular values: assume at least 2 columns besides 'cluster'
-    sing_cols = [c for c in sv.columns if c != "cluster"]
-    if len(sing_cols) < 2:
-        raise RuntimeError("singular_values.csv must have at least 2 singular value columns besides 'cluster'.")
-    leading_sing_col = sing_cols[0]
-    second_sing_col  = sing_cols[1]
-
-    # --------------------------------------------------------
-    # 4. Merge metrics and compute σ2/σ1
-    # --------------------------------------------------------
-    metrics = ti.merge(
-        sv[["cluster", leading_sing_col, second_sing_col]],
-        on="cluster",
-        how="inner",
-    )
-
-    # Avoid division by zero
-    denom = metrics[leading_sing_col].replace(0, np.nan)
-    metrics["second_to_first_ratio"] = metrics[second_sing_col] / denom
-
-    # --------------------------------------------------------
-    # 5. Select "important" clusters by leading importance
-    # --------------------------------------------------------
-    importance_cutoff = metrics[leading_imp_col].quantile(importance_quantile)
-    important_clusters = metrics.loc[
-        metrics[leading_imp_col] >= importance_cutoff, "cluster"
-    ].tolist()
-
-    print(f"[Filtering] Importance cutoff ({importance_quantile:.2f} quantile): {importance_cutoff:.6f}")
-    print(f"[Filtering] Number of important clusters: {len(important_clusters)}")
-
-    # --------------------------------------------------------
-    # 6. Select clusters where TF2 looks non-trivial (σ2/σ1 >= ratio_cutoff)
-    # --------------------------------------------------------
-    useful_tf2_clusters = metrics.loc[
-        metrics["second_to_first_ratio"] >= ratio_cutoff, "cluster"
-    ].tolist()
-
-    print(f"[Filtering] Clusters where TF2 is 'useful' (σ2/σ1 >= {ratio_cutoff:.2f}): {len(useful_tf2_clusters)}")
-
-    # --------------------------------------------------------
-    # 7. Filter first_doc_topics (TF1) to important clusters only
-    # --------------------------------------------------------
-    fd_cols_to_keep = ["document"]
-    for c in important_clusters:
-        col_name = f"topic_loading_{c}"
-        if col_name in fd.columns:
-            fd_cols_to_keep.append(col_name)
-
-    fd_filtered = fd[fd_cols_to_keep]
-    fd_filtered_path = os.path.join(out_folder, "first_doc_topics_filtered.csv")
-    fd_filtered.to_csv(fd_filtered_path, index=False)
-    print(f"[Filtering] Saved filtered TF1 loadings to: {fd_filtered_path}")
-
-    # --------------------------------------------------------
-    # 8. Filter second_doc_topics (TF2) only for clusters where TF2 is useful
-    # --------------------------------------------------------
-    # Intersection: important clusters AND TF2-useful clusters
-    tf2_clusters = sorted(set(important_clusters).intersection(useful_tf2_clusters))
-
-    sd_cols_to_keep = ["document"]
-    for c in tf2_clusters:
-        col_name = f"topic_loading_{c}"
-        if col_name in sd.columns:
-            sd_cols_to_keep.append(col_name)
-
-    sd_filtered = sd[sd_cols_to_keep]
-    sd_filtered_path = os.path.join(out_folder, "second_doc_topics_filtered.csv")
-    sd_filtered.to_csv(sd_filtered_path, index=False)
-    print(f"[Filtering] Saved filtered TF2 loadings to: {sd_filtered_path}")
-
-    # --------------------------------------------------------
-    # 9. Filter topics_words to important clusters (for interpretation)
-    # --------------------------------------------------------
-    if "topic" in tw.columns:
-        tw_filtered = tw[tw["topic"].isin(important_clusters)]
-    elif "cluster" in tw.columns:
-        # fallback if column happens to be named 'cluster'
-        tw_filtered = tw[tw["cluster"].isin(important_clusters)]
-    else:
-        raise RuntimeError("topics_words.csv must have either a 'topic' or 'cluster' column.")
-
-    tw_filtered_path = os.path.join(out_folder, "topics_words_filtered.csv")
-    tw_filtered.to_csv(tw_filtered_path, index=False)
-    print(f"[Filtering] Saved filtered topics_words to: {tw_filtered_path}")
-
-    # --------------------------------------------------------
-    # 10. Save metrics-with-ratios for diagnostics
-    # --------------------------------------------------------
-    metrics_path = os.path.join(out_folder, "topic_metrics_with_ratios.csv")
-    metrics.to_csv(metrics_path, index=False)
-    print(f"[Filtering] Saved topic metrics (incl. σ2/σ1) to: {metrics_path}")
-
 
 # ============================================================
 # MAIN PIPELINE
@@ -650,26 +516,40 @@ def main():
     )
     print(f"Loaded {len(report_paragraphs)} paragraphs")
 
-    # === NEW STEP 2A: Build paragraph-level DataFrame for Word2Vec ===
-    df_paragraphs = pd.DataFrame({
-        "content": report_paragraphs,
-        "file": report_sources
-    })
+    # ---------------------------------------------------------
+    # STEP 2: Build two DataFrames
+    # df_paragraphs → paragraph-level (for Word2Vec + LSH)
+    # df_docs       → report-level  (for final TFs)
+    # ---------------------------------------------------------
+    df_paragraphs, df_docs = build_document_dataframes(
+        report_paragraphs, report_sources, report_pages
+    )
 
-    # Clean + tokenize paragraphs for Word2Vec training
-    df_paragraphs = preprocess_and_count_words(df_paragraphs)
-
-    print("\n=== STEP 2: Build document-level DataFrame ===")
-    df_docs = build_document_dataframe(report_paragraphs, report_sources)
+    print("=== STEP 2: Build document-level DataFrames ===")
+    print("Paragraph-level docs (for Word2Vec):", len(df_paragraphs))
+    print("Report-level docs (for TF regressions):", len(df_docs))
     print(df_docs.head())
 
-    print("\n=== STEP 3: Clean text + tokenize + count words ===")
-    df_docs = preprocess_and_count_words(df_docs)
+    # ---------------------------------------------------------
+    # STEP 3: Clean + tokenize paragraphs
+    # (NOT report-level!)
+    # ---------------------------------------------------------
+    print("\n=== STEP 3: Clean text + tokenize paragraphs ===")
+    df_paragraphs = preprocess_and_count_words(df_paragraphs)
 
-    print("\n=== STEP 4: Create OpenAI Embeddings ===")
-    vocab, embedding_matrix = train_openai_embeddings(df_paragraphs)
+    print("Example cleaned paragraph:", df_paragraphs['content'].iloc[0][:200])
+    print("Example tokens:", df_paragraphs['tokens'].iloc[0][:20])
+
+    # ---------------------------------------------------------
+    # STEP 4: Train Word2Vec on PARAGRAPHS
+    # ---------------------------------------------------------
+    print("\n=== STEP 4: Train Word2Vec on paragraph-level tokens ===")
+    w2v_model, vocab, embedding_matrix = train_word2vec(df_paragraphs)
     print(f"Vocabulary size: {len(vocab)}")
 
+    # ---------------------------------------------------------
+    # STEP 5: Cluster word embeddings
+    # ---------------------------------------------------------
     print("\n=== STEP 5: Cluster word embeddings (LSH sequential clustering) ===")
     ec, clusters, cluster_words_map, word_cluster_map = cluster_words(
         embedding_matrix,
@@ -678,21 +558,60 @@ def main():
     )
     print(f"Number of clusters: {len(clusters)}")
 
+    # ---------------------------------------------------------
+    # STEP 6: Build document-word & cluster-word tables
+    # Use PARAGRAPH-LEVEL doc-word matrix, then aggregate to reports
+    # ---------------------------------------------------------
     print("\n=== STEP 6: Build document-word and word-cluster tables ===")
-    document_word_data = build_document_word_data(df_docs, vocab)
+
+    df_paragraphs = df_paragraphs.rename(columns={"paragraph_id": "document"})
+    document_word_data = build_document_word_data(df_paragraphs, vocab)
     word_cluster_data  = build_word_cluster_data(vocab, word_cluster_map)
 
     print(document_word_data.head())
     print(word_cluster_data.head())
 
-    print("\n=== STEP 7: Compute Textual Factors (SVD / LSA) ===")
-    tf_results = compute_textual_factors(
-        document_word_data,
-        word_cluster_data,
-        n_topics=N_TOPICS_PER_CLUSTER,
+    # ---------------------------------------------------------
+    # STEP 6b: Aggregate paragraph-level document-word to REPORT level
+    # (1 document = 1 annual report)
+    # ---------------------------------------------------------
+    print("\n=== Aggregating paragraph-level counts to report-level ===")
+
+    # Map each paragraph to its report
+    paragraph_to_report = df_paragraphs[["document", "file"]]
+
+    merged = document_word_data.merge(paragraph_to_report, on="document", how="left")
+
+    report_word_counts = (
+        merged.groupby(["file", "ngram"])["count"]
+        .sum()
+        .reset_index()
     )
 
-    # Create output folder
+    # assign document ids matching df_docs
+    report_word_counts = report_word_counts.merge(
+        df_docs[["file", "document"]],
+        on="file",
+        how="left"
+    )
+
+    report_word_counts = report_word_counts.rename(columns={"document": "report_document"})
+
+    # rebuild document_word_data FOR REPORTS
+    document_word_data_reports = report_word_counts[["report_document", "ngram", "count"]]
+    document_word_data_reports = document_word_data_reports.rename(
+        columns={"report_document": "document"}
+    )
+
+    # ---------------------------------------------------------
+    # STEP 7: Compute Textual Factors (on report-level doc-word matrix)
+    # ---------------------------------------------------------
+    print("\n=== STEP 7: Compute Textual Factors (SVD / LSA) ===")
+    tf_results = compute_textual_factors(document_word_data_reports, word_cluster_data)
+
+    # ---------------------------------------------------------
+    # SAVE OUTPUT
+    # ---------------------------------------------------------
     out_folder = "outputs_textual_factors"
     os.makedirs(out_folder, exist_ok=True)
 
@@ -703,77 +622,16 @@ def main():
     tf_results["singular_values_df"].to_csv(f"{out_folder}/singular_values.csv", index=False)
     tf_results["topic_importances_df"].to_csv(f"{out_folder}/topic_importances.csv", index=False)
 
-    # Optional: downstream filtering step (3a + 3b from the thesis description)
-    print("\n=== Filtering topics based on importance and singular values ===")
-    filter_textual_factors(
-        out_folder=out_folder,
-        importance_quantile=0.75,  # keep top 25% most important clusters
-        ratio_cutoff=0.2,          # require σ2/σ1 >= 0.2 for TF2 to be kept
-    )
-
     print("\nPipeline finished ✓")
     print("Outputs written to:", out_folder)
+
 
 
 if __name__ == "__main__":
     main()
 
-# Improvements:
-# - Cluster size:
-#     * Currently cluster_size = 50, which yields ~600 small clusters (≈5–6 words each).
-#     * Possible improvement: run a small sensitivity analysis on cluster_size
-#       (e.g. 30, 50, 80) and see how robust the main TFs are.
-#
-# - Ingestion of documents:
-#     * Filenames must follow the pattern "YYYY_<Bank>_group.pdf" (or .pdf.pdf as now),
-#       because year/bank are parsed from the name.
-#     * page_ranges keys must match the exact filenames in Reports/.
-#       If the naming convention changes, update both the regex in
-#       build_document_dataframe() and the page_ranges dict.
-#
-# - Number of topics per cluster:
-#     * Currently N_TOPICS_PER_CLUSTER = 2 (TF1 + TF2 as a robustness check).
-#     * For the final empirical analysis, consider using only TF1
-#       (set N_TOPICS_PER_CLUSTER = 1) and treat TF2 as diagnostics.
-#
-# - Filtering clusters and topics:
-#     * Not all clusters / topics will be relevant economically.
-#     * After running the pipeline, use topic_importances.csv and singular_values.csv
-#       to filter out weak or noisy components:
-#           - Drop clusters where overall topic_importance is very low.
-#           - Optionally drop TF2 if its singular value is much smaller than TF1
-#             or if the associated words are not interpretable as a clear risk theme.
-#     * This filtering is done downstream (in a separate analysis script / notebook),
-#       but it is an explicit modelling choice and should be documented in the thesis.
 
 
-# Manual modelling settings / hyperparameters:
-# - Sample design:
-#     * Which banks and years are included (which PDFs in Reports/)
-#     * Which pages per PDF (page_ranges, default_pages)
-#     * Specific fil name
-#
-# - Text preprocessing (engine.py):
-#     * Stopword list (English)
-#     * Lemmatization (WordNetLemmatizer)
-#     * Removal of digits and punctuation
-#     * Currently unigrams only (no bigrams yet)
-#
-# - Embeddings (OpenAI):
-#     * model_name = "text-embedding-3-small"
-#     * Vocabulary built from cleaned tokens across all paragraphs
-#     * Embeddings retrieved via OpenAI API (no local training hyperparameters)
-#
-# - Neighbor search / LSH:
-#     * neighbor_alg = "lsh" (vs "brutal")
-#     * N_BITS = 128, N_TABLES = 32  (LSH hyperparameters)
-#
-# - Clustering:
-#     * cluster_size = 50  (target max words per cluster – implies number of clusters)
-#
-# - Textual factors (SVD / LSA):
-#     * cluster_type = "sequential_cluster"
-#     * n_topics = 2 per cluster (TF1 and TF2; TF2 mainly as robustness check)
 
 
 # Note on unused functions:
@@ -792,4 +650,5 @@ if __name__ == "__main__":
 #   Cong et al. use a simple sequential LSH-based clustering, so alternative algorithms add no value.
 
 # - Internal TextualFactors helpers (normalization/diagnostics) are not required.
-#   Only the SVD-based lsa_topics() method is needed to construct textual factors from cl
+#   Only the SVD-based lsa_topics() method is needed to construct textual factors from clustered words.
+

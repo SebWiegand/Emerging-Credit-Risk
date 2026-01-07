@@ -21,7 +21,7 @@ from TextualFactors import NeighborFinder
 # ============================================================
 # 1. Load the embedding matrix
 # ============================================================
-embedding_matrix_path = "embedding_matrix.npy"  # adjust if saved elsewhere
+embedding_matrix_path = "../embedding_matrix.npy"  # adjust if saved elsewhere
 
 print(f"Loading embeddings from: {embedding_matrix_path}")
 if not os.path.exists(embedding_matrix_path):
@@ -48,7 +48,7 @@ print("NeighborFinder initialized.")
 
 # ============================================================
 # 3. Use THEIR hyperparameter optimizer
-# ============================================================
+# ==============================================a==============
 # Note: optimize_lsh_hyperparameters internally:
 #   - loops over bits & tables
 #   - creates LSH indices

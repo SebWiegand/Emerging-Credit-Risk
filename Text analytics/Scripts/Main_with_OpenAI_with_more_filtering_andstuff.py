@@ -4,7 +4,22 @@ from itertools import chain  # currently unused, but kept so you recognize it
 import fitz  # PyMuPDF
 import numpy as np
 import pandas as pd
-from gensim.models import Word2Vec
+from collections import Counter
+from openai import OpenAI
+
+import ast
+import re
+
+# Read API key from environment variable (set in PyCharm Run Configuration)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+if OPENAI_API_KEY is None:
+    raise RuntimeError(
+        "Missing OPENAI_API_KEY environment variable. "
+        "Set it in Run → Edit Configurations → Environment variables."
+    )
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # --- helper functions from engine.py ---
 from engine import (
@@ -23,6 +38,8 @@ from TextualFactors import (
     transfer_topic_importances,
 )
 
+
+
 # ============================================================
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
@@ -32,37 +49,130 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Folder with your annual reports (the Reports folder in your project)
 reports_folder = os.path.join(PROJECT_ROOT, "Reports")
-
+# If you prefer, you can hard-code:
+# reports_folder = "/Users/sebastianwiegandmoller/PycharmProjects/Emerging-Credit-Risk/Reports"
 
 # Your own page_ranges (copied from your notebook)
 page_ranges = {
-    # 2024 files
-    "2024_Danske_group.pdf": range(208, 240),
-    "2024_UBS_group.pdf": range(88, 136),
-    "2024_DeutscheBank_group.pdf": range(91, 208),
-    "2024_ING_group.pdf": range(158, 222),
 
-    # 2023 files
-    "2023_Danske_group.pdf": range(175, 213),
-    "2023_UBS_group.pdf": range(97, 153),
-    "2023_DeutscheBank_group.pdf": range(91, 208),
-    "2023_ING_group.pdf": range(131, 204),
-
-    # 2022 files
-    "2022_Danske_group.pdf": range(169, 208),
-    "2022_UBS_group.pdf": range(83, 134),
-    "2022_DeutscheBank_group.pdf": range(90, 213),
-    "2022_ING_group.pdf": range(103, 185),
-
-    # 2021 files
+    # =========================
+    # 2021
+    # =========================
+    "2021_Barclays_group.pdf": range(199, 288),
+    "2021_BNPparibas_group.pdf": range(170, 192),
     "2021_Danske_group.pdf": range(159, 194),
-    "2021_UBS_group.pdf": range(98, 150),
     "2021_DeutscheBank_group.pdf": range(84, 201),
     "2021_ING_group.pdf": range(45, 150),
+    "2021_OPPohjola_group.pdf": range(1, 22),
+    "2021_SEB_group.pdf": range(89, 96),
+    "2021_UBS_group.pdf": range(98, 150),
+
+    # =========================
+    # 2022
+    # =========================
+    "2022_Barclays_group.pdf": range(263, 369),
+    "2022_BNPparibas_group.pdf": range(170, 192),
+    "2022_Danske_group.pdf": range(169, 208),  # note double .pdf as in filename
+    "2022_DeutscheBank_group.pdf": range(90, 213),
+    "2022_ING_group.pdf": range(103, 185),
+    "2022_OPPohjola_group.pdf": range(1, 22),
+    "2022_SEB_group.pdf": range(82, 91),
+    "2022_UBS_group.pdf": range(83, 134),
+
+    # =========================
+    # 2023
+    # =========================
+    "2023_Barclays_group.pdf": range(253, 362),
+    "2023_BNPparibas_group.pdf": range(166, 190),
+    "2023_Danske_group.pdf": range(175, 213),
+    "2023_DeutscheBank_group.pdf": range(91, 208),
+    "2023_ING_group.pdf": range(131, 204),
+    "2023_OPPohjola_group.pdf": range(1, 34),
+    "2023_SEB_group.pdf": range(50, 59),
+    "2023_UBS_group.pdf": range(97, 153),
+
+    # =========================
+    # 2024
+    # =========================
+    "2024_Barclays_group.pdf": range(262, 382),
+    "2024_BNPparibas_group.pdf": range(160, 184),
+    "2024_Danske_group.pdf": range(208, 240),
+    "2024_DeutscheBank_group.pdf": range(91, 208),
+    "2024_ING_group.pdf": range(158, 222),
+    "2024_OPPohjola_group.pdf": range(40, 81),
+    "2024_SEB_group.pdf": range(50, 59),
+    "2024_UBS_group.pdf": range(88, 136),
 }
 
-# Default pages if a file is not in page_ranges
-default_pages = range(0, 10)  # first 10 pages
+# IMPORTANT: No silent fallback. Every PDF must have an explicit page range.
+# If a PDF filename is not in `page_ranges`, the pipeline will stop with an error.
+default_pages = None
+
+# ============================================================
+# 0B. TOKEN / VOCAB FILTERING (IMPORTANT FOR INTERPRETABILITY)
+# ============================================================
+
+TOKEN_MIN_LEN = 3
+MIN_DF = 2            # token must appear in at least MIN_DF documents
+MAX_DF_RATIO = 0.70   # drop tokens that appear in more than this share of documents
+
+EXTRA_DROP_WORDS = {
+    # Generic report boilerplate
+    "annual", "report", "reports", "group", "plc", "page", "pages", "section", "chapter",
+    "table", "tables", "figure", "figures", "statement", "statements",
+    "introduction", "overview", "note", "notes",
+
+    # Bank names / identifiers (extend as needed)
+    "barclays", "seb", "ubs", "ing", "danske", "deutschebank", "deutsche", "bank",
+    "bnp", "paribas", "fortis", "oppohjola", "op", "pohjola",
+
+    # Common legal entities
+    "limited", "ltd", "ab", "asa", "as",
+}
+
+def _basic_token_filter(tokens):
+    """Remove obvious junk tokens before df-based filtering."""
+    out = []
+    for t in tokens:
+        if not isinstance(t, str):
+            continue
+        t = t.strip().lower()
+        if not t:
+            continue
+        if len(t) < TOKEN_MIN_LEN:
+            continue
+        # keep only alphabetic tokens -> removes '_' and mixed punctuation/nums
+        if not t.isalpha():
+            continue
+        if t in EXTRA_DROP_WORDS:
+            continue
+        out.append(t)
+    return out
+
+def filter_tokens_with_df_rules(df, tokens_col="tokens", min_df=MIN_DF, max_df_ratio=MAX_DF_RATIO):
+    """
+    1) basic token filtering per document
+    2) document-frequency filtering across corpus (min_df/max_df)
+
+    Returns COPY of df with filtered tokens.
+    """
+    df = df.copy()
+
+    # 1) per-doc filtering
+    df[tokens_col] = df[tokens_col].apply(_basic_token_filter)
+
+    # doc frequency
+    doc_n = len(df)
+    df_counter = Counter()
+    for toks in df[tokens_col]:
+        df_counter.update(set(toks))
+
+    max_df = int(max_df_ratio * doc_n)
+    allowed = {tok for tok, dfi in df_counter.items() if (dfi >= min_df) and (dfi <= max_df)}
+
+    # 2) apply df rule
+    df[tokens_col] = df[tokens_col].apply(lambda toks: [t for t in toks if t in allowed])
+    return df
 
 # ============================================================
 # 1. LOAD TEXT FROM PDF´s
@@ -86,11 +196,13 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
             print(f"Processing {_file}...")
             full_path = os.path.join(path, _file)
 
-            # Decide which pages to process
-            if _file in page_ranges:
-                pages_to_process = page_ranges[_file]
-            else:
-                pages_to_process = default_pages
+            # Decide which pages to process (STRICT: require explicit page ranges)
+            if _file not in page_ranges:
+                raise ValueError(
+                    f"File '{_file}' not found in page_ranges. "
+                    "Add an explicit page range for this PDF (no defaults)."
+                )
+            pages_to_process = page_ranges[_file]
 
             with fitz.open(full_path) as doc:
                 total_pages = len(doc)
@@ -201,7 +313,6 @@ def preprocess_and_count_words(df):
     # 2) Tokenize + count word frequencies.
     #    calculate_word_frequencies expects a text column (default 'text'),
     #    so we tell it to use 'content'.
-    #    Removes stopwords
     df = calculate_word_frequencies(df, text_column="content")
 
     return df
@@ -217,70 +328,37 @@ def preprocess_and_count_words(df):
 # but our documents are grouped by bank-year, not by calendar dates, so these functions are not needed here.
 
 
+
 # ============================================================
-# 4. TRAIN WORD2VEC ON CLEANED TOKENS
+# 4. OPENAI EMBEDDING FUNCTION
 # ============================================================
 
-def train_word2vec(df):
+def train_openai_embeddings(df, model_name="text-embedding-3-small"):
     """
-    Train a Word2Vec model on the tokenized documents.
-
-    Input:
-    - df : DataFrame with a 'tokens' column
-           (each row is a list of words for one document)
-
-    Output:
-    - w2v_model       : the trained gensim Word2Vec model
-    - vocab           : list of words in the vocabulary
-    - embedding_matrix: numpy array of shape (V, D),
-                        where V = vocab size, D = embedding dimension
+    Build word embeddings using OpenAI's embedding API.
+    Trains on paragraph-level tokens.
     """
+    vocab = sorted(set(chain.from_iterable(df["tokens"].tolist())))
+    print(f"Vocabulary size: {len(vocab)} words")
 
-    # df['tokens'] is a list of tokens per document (from calculate_word_frequencies)
-    tokenized_docs = df["tokens"].tolist()
+    batch_size = 500
+    embeddings = []
 
-    print("Number of documents going into Word2Vec:", len(tokenized_docs))
-    if tokenized_docs:
-        print("Example doc tokens:", tokenized_docs[0][:20])
+    for i in range(0, len(vocab), batch_size):
+        batch = vocab[i:i+batch_size]
+        response = client.embeddings.create(
+            model=model_name,
+            input=batch
+        )
+        batch_embs = [item.embedding for item in response.data]
+        embeddings.extend(batch_embs)
+        print(f"Processed batch {i//batch_size + 1}")
 
-    if len(tokenized_docs) == 0:
-        raise RuntimeError("No documents available for Word2Vec training.")
-
-    # Train the Word2Vec model
-    w2v_model = Word2Vec(
-        sentences=tokenized_docs,
-        vector_size=300,  # embedding dimension (D)
-        window=5,         # context window size
-        min_count=5,      # ignore words that appear fewer than 5 times
-        workers=4,        # number of CPU cores to use
-        sg=1,             # 1 = skip-gram, 0 = CBOW
-        seed= 42,
-        epochs=20,
-    )
-
-    # Get the learned word vectors
-    word_vectors = w2v_model.wv
-    vocab = list(word_vectors.key_to_index.keys())
-    embedding_dim = word_vectors.vector_size
-
-    # Build an embedding matrix aligned with vocab
-    embedding_matrix = np.zeros((len(vocab), embedding_dim), dtype=np.float32)
-    for i, w in enumerate(vocab):
-        embedding_matrix[i, :] = word_vectors[w]
-
-    print(f"Trained Word2Vec: {len(vocab)} words, dim={embedding_dim}")
-
-# Output:
-# - w2v_model        : trained Word2Vec model
-# - vocab            : list of all words in the model's vocabulary
-# - embedding_matrix : 2D array with one vector per word in 'vocab'
-
-    # ------------------------------------------------------------
-    # SAVE embedding_matrix so tune_lsh.py can load it
-    # ------------------------------------------------------------
-    np.save("embedding_matrix.npy", embedding_matrix)
+    embedding_matrix = np.array(embeddings, dtype=np.float32)
+    np.save("../embedding_matrix.npy", embedding_matrix)
     print("Saved embedding_matrix.npy in:", os.getcwd())
-    return w2v_model, vocab, embedding_matrix
+    return vocab, embedding_matrix
+
 
 
 # ============================================================
@@ -289,13 +367,16 @@ def train_word2vec(df):
 # ============================================================
 
 # ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
-N_BITS = 128    # number of hash bits = hyperplanes per table
-N_TABLES = 32   # number of hash tables
+N_BITS = 256    # number of hash bits = hyperplanes per table  (example)
+N_TABLES = 32   # number of hash tables                       (example)
+
+# Global hyperparameter: number of LSA topics per clustera
+N_TOPICS_PER_CLUSTER = 1
 
 
 def cluster_words(
     embedding_matrix,
-    cluster_size=50,
+    cluster_size=100,
     neighbor_alg="lsh",
 ):
     """
@@ -379,14 +460,17 @@ def build_document_word_data(df, vocab):
     - document (document ID)
     - ngram (word)
     - count (frequency of the word in that document)
+
+    This is the format expected by TextualFactors.
     """
 
     rows = []
     vocab_set = set(vocab)
 
+    # df["word_freq"] is a dict: word → count for each document
     for doc_id, word_counts in zip(df["document"], df["word_freq"]):
         for word, count in word_counts.items():
-            if word in vocab_set:
+            if word in vocab_set:  # keep only words that exist in the embedding model
                 rows.append(
                     {
                         "document": doc_id,
@@ -403,6 +487,7 @@ def build_document_word_data(df, vocab):
     )
 
     return doc_word_df
+
 
 
 def build_word_cluster_data(vocab, word_cluster_map):
@@ -436,7 +521,7 @@ def build_word_cluster_data(vocab, word_cluster_map):
 # ============================================================
 
 
-def compute_textual_factors(document_word_data, word_cluster_data, n_topics=2):
+def compute_textual_factors(document_word_data, word_cluster_data, n_topics=1):
     """
     Compute textual factors using the TextualFactors class.
     This performs SVD (LSA) inside each word cluster.
@@ -474,11 +559,19 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=2):
         n_topics=n_topics
     )
 
-    # 3. Convert numpy outputs to DataFrames for easy use/export
-    first_doc_topics_df  = transfer_document_topics(first_doc_topics)
-    second_doc_topics_df = transfer_document_topics(second_doc_topics)
-    topics_words_df      = transfer_topic_words(first_topics_words)
-    singular_values_df   = transfer_sigular_values(singular_values)
+    # TF1
+    first_doc_topics_df = transfer_document_topics(first_doc_topics)
+
+    # TF2: kun hvis vi faktisk har bedt om 2 topics
+    if n_topics < 2:
+        second_doc_topics_df = pd.DataFrame(columns=["cluster_id", "document", "topic_loading"])
+    else:
+        second_doc_topics_df = transfer_document_topics(second_doc_topics)
+
+    # Word-level topic loadings (TF1)
+    topics_words_df = transfer_topic_words(first_topics_words)
+
+    singular_values_df = transfer_sigular_values(singular_values)
     topic_importances_df = transfer_topic_importances(topic_importances)
 
     return {
@@ -497,8 +590,240 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=2):
 # - topic importance weights
 
 
-# Global hyperparameter: number of LSA topics per cluster
-N_TOPICS_PER_CLUSTER = 2
+# ============================================================
+# 7B. EXPORT TOP-20 SUMMARIES (TOP CLUSTERS, TOP WORDS, TOP LOADINGS)
+# ============================================================
+
+def _pick_first_existing_col(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _pick_first_numeric_col(df, exclude_cols=None, prefer_substr=None):
+    exclude_cols = set(exclude_cols or [])
+    num_cols = [c for c in df.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df[c])]
+    if not num_cols:
+        return None
+    if prefer_substr:
+        for c in num_cols:
+            if prefer_substr in c.lower():
+                return c
+    return num_cols[0]
+
+
+def _load_first_doc_topics_as_long(path_csv):
+    """
+    Supports BOTH formats:
+    (A) Long:  columns like [cluster_id, document, topic_loading]
+    (B) Wide:  columns like [document, topic_loading_0, topic_loading_1, ...]
+    Returns long df with columns: cluster_id, document, topic_loading
+    """
+    df = pd.read_csv(path_csv)
+
+    # Long format already?
+    if "cluster_id" in df.columns and "document" in df.columns and "topic_loading" in df.columns:
+        return df[["cluster_id", "document", "topic_loading"]].copy()
+
+    # Wide format: melt topic_loading_{cluster}
+    if "document" not in df.columns:
+        raise RuntimeError(f"first_doc_topics.csv has no 'document' column. Found columns: {list(df.columns)}")
+
+    topic_cols = [c for c in df.columns if c.startswith("topic_loading_")]
+    if not topic_cols:
+        raise RuntimeError(
+            "Could not find topic loading columns in first_doc_topics.csv. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    long_df = df.melt(
+        id_vars=["document"],
+        value_vars=topic_cols,
+        var_name="cluster_id",
+        value_name="topic_loading",
+    )
+    long_df["cluster_id"] = long_df["cluster_id"].str.replace("topic_loading_", "", regex=False)
+    long_df["cluster_id"] = pd.to_numeric(long_df["cluster_id"], errors="coerce")
+    long_df = long_df.dropna(subset=["cluster_id"]).copy()
+    long_df["cluster_id"] = long_df["cluster_id"].astype(int)
+
+    return long_df[["cluster_id", "document", "topic_loading"]]
+
+
+def _topics_words_to_long(tw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize topics_words output to a long DataFrame with columns:
+      - cluster_id
+      - word
+      - word_loading
+
+    Supports two formats:
+      (A) already-long with cluster/word/loading columns
+      (B) compact format with columns: ['topic', 'topic_distribution'] where
+          topic_distribution is a stringified list of (word, loading) pairs.
+    """
+
+    # Case B: compact format from transfer_topic_words
+    if "topic" in tw.columns and "topic_distribution" in tw.columns and len(tw.columns) == 2:
+        rows = []
+        for _, r in tw.iterrows():
+            topic = r["topic"]
+
+            # Extract numeric cluster id from topic (handles int, '12', 'cluster_12', etc.)
+            cluster_id = None
+            if pd.isna(topic):
+                continue
+            if isinstance(topic, (int, np.integer)):
+                cluster_id = int(topic)
+            else:
+                s = str(topic)
+                m = re.search(r"\d+", s)
+                if m:
+                    cluster_id = int(m.group())
+            if cluster_id is None:
+                continue
+
+            dist = r["topic_distribution"]
+            if pd.isna(dist):
+                continue
+
+            # Parse distribution into iterable of (word, loading)
+            parsed = None
+            if isinstance(dist, str):
+                try:
+                    parsed = ast.literal_eval(dist)
+                except Exception:
+                    parsed = None
+            else:
+                parsed = dist
+
+            if parsed is None:
+                continue
+
+            if isinstance(parsed, dict):
+                items = parsed.items()
+            else:
+                items = parsed
+
+            for item in items:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                word = item[0]
+                try:
+                    loading = float(item[1])
+                except Exception:
+                    continue
+                rows.append({
+                    "cluster_id": cluster_id,
+                    "word": str(word),
+                    "word_loading": loading,
+                })
+
+        return pd.DataFrame(rows, columns=["cluster_id", "word", "word_loading"])
+
+    # Case A: already-long format (try to detect common column names)
+    tw_cluster_col = _pick_first_existing_col(tw, ["cluster_id", "sequential_cluster", "cluster"])
+    word_col = _pick_first_existing_col(tw, ["ngram", "word", "token", "term"])
+    loading_col = _pick_first_numeric_col(tw, exclude_cols=[c for c in [tw_cluster_col] if c], prefer_substr="loading")
+    if loading_col is None:
+        loading_col = _pick_first_numeric_col(tw, exclude_cols=[c for c in [tw_cluster_col] if c], prefer_substr="weight")
+
+    if tw_cluster_col and word_col and loading_col:
+        out = tw[[tw_cluster_col, word_col, loading_col]].copy()
+        out = out.rename(columns={tw_cluster_col: "cluster_id", word_col: "word", loading_col: "word_loading"})
+        out["cluster_id"] = pd.to_numeric(out["cluster_id"], errors="coerce")
+        out = out.dropna(subset=["cluster_id"]).copy()
+        out["cluster_id"] = out["cluster_id"].astype(int)
+        out["word_loading"] = pd.to_numeric(out["word_loading"], errors="coerce")
+        out = out.dropna(subset=["word_loading"]).copy()
+        return out[["cluster_id", "word", "word_loading"]]
+
+    raise RuntimeError(
+        "Could not normalize topics_words to long format. "
+        f"Found columns: {list(tw.columns)}"
+    )
+
+
+def export_top20_summaries(out_folder="outputs_textual_factors", top_n=20, top_words_per_cluster=20):
+    """
+    Writes four CSVs into out_folder:
+      1) top20_topic_importances.csv
+      2) top20_first_doc_topics.csv          (top |loading| rows among top clusters)
+      3) top20_words_per_top_cluster.csv     (top words per cluster by |word_loading|)
+      4) top20_topic_words_overall.csv       (top words overall across top clusters)
+
+    Robust to wide vs long first_doc_topics format.
+    """
+    imp_path = os.path.join(out_folder, "topic_importances.csv")
+    words_path = os.path.join(out_folder, "topics_words.csv")
+    doc_path = os.path.join(out_folder, "first_doc_topics.csv")
+
+    if not (os.path.exists(imp_path) and os.path.exists(words_path) and os.path.exists(doc_path)):
+        print("[export_top20_summaries] Skipping: required CSVs not found in", out_folder)
+        return
+
+    # ----------------------
+    # 1) Topic importances
+    # ----------------------
+    imp = pd.read_csv(imp_path)
+
+    cluster_col = _pick_first_existing_col(imp, ["cluster_id", "sequential_cluster", "cluster"])
+    if cluster_col is None:
+        cluster_col = imp.columns[0]  # fallback
+
+    importance_col = _pick_first_numeric_col(imp, exclude_cols=[cluster_col], prefer_substr="importance")
+    if importance_col is None:
+        raise RuntimeError(
+            f"Could not find a numeric importance column in {imp_path}. Found columns: {list(imp.columns)}"
+        )
+
+    imp_small = imp[[cluster_col, importance_col]].copy()
+    imp_small = imp_small.rename(columns={cluster_col: "cluster_id", importance_col: "topic_importance"})
+    imp_small["cluster_id"] = pd.to_numeric(imp_small["cluster_id"], errors="coerce")
+    imp_small = imp_small.dropna(subset=["cluster_id"]).copy()
+    imp_small["cluster_id"] = imp_small["cluster_id"].astype(int)
+
+    top_imp = imp_small.sort_values("topic_importance", ascending=False).head(top_n)
+    top_imp.to_csv(os.path.join(out_folder, "top20_topic_importances.csv"), index=False)
+    top_clusters = top_imp["cluster_id"].tolist()
+
+    # ----------------------
+    # 2) First doc topics (TF1 loadings)
+    # ----------------------
+    doc_long = _load_first_doc_topics_as_long(doc_path)
+    doc_long = doc_long[doc_long["cluster_id"].isin(top_clusters)].copy()
+
+    doc_long["abs_loading"] = doc_long["topic_loading"].abs()
+    top_doc = doc_long.sort_values("abs_loading", ascending=False).head(top_n).drop(columns=["abs_loading"])
+    top_doc.to_csv(os.path.join(out_folder, "top20_first_doc_topics.csv"), index=False)
+
+    # ----------------------
+    # 3) Topic words (TF1 word loadings)
+    # ----------------------
+    tw_raw = pd.read_csv(words_path)
+    tw_small = _topics_words_to_long(tw_raw)
+
+    tw_top = tw_small[tw_small["cluster_id"].isin(top_clusters)].copy()
+    tw_top["abs_word_loading"] = tw_top["word_loading"].abs()
+
+    # (a) Top words per top cluster
+    rows = []
+    for cid in top_clusters:
+        sub = tw_top[tw_top["cluster_id"] == cid].sort_values("abs_word_loading", ascending=False)
+        rows.append(sub.head(top_words_per_cluster))
+    top_words_per_cluster_df = (
+        pd.concat(rows, ignore_index=True).drop(columns=["abs_word_loading"])
+        if rows else
+        pd.DataFrame(columns=["cluster_id", "word", "word_loading"])
+    )
+    top_words_per_cluster_df.to_csv(os.path.join(out_folder, "top20_words_per_top_cluster.csv"), index=False)
+
+    # (b) Top words overall across top clusters
+    top_words_overall = tw_top.sort_values("abs_word_loading", ascending=False).head(top_n).drop(columns=["abs_word_loading"])
+    top_words_overall.to_csv(os.path.join(out_folder, "top20_topic_words_overall.csv"), index=False)
+
+    print(f"[export_top20_summaries] Wrote top-20 summaries to: {out_folder} (clusters={len(top_clusters)})")
 
 # ============================================================
 # MAIN PIPELINE
@@ -513,28 +838,40 @@ def main():
     )
     print(f"Loaded {len(report_paragraphs)} paragraphs")
 
+    # === NEW STEP 2A: Build paragraph-level DataFrame for Word2Vec ===
+    df_paragraphs = pd.DataFrame({
+        "content": report_paragraphs,
+        "file": report_sources
+    })
+
+    # Clean + tokenize paragraphs for Word2Vec training
+    df_paragraphs = preprocess_and_count_words(df_paragraphs)
+    df_paragraphs = filter_tokens_with_df_rules(df_paragraphs, tokens_col="tokens")
+
     print("\n=== STEP 2: Build document-level DataFrame ===")
     df_docs = build_document_dataframe(report_paragraphs, report_sources)
     print(df_docs.head())
 
     print("\n=== STEP 3: Clean text + tokenize + count words ===")
     df_docs = preprocess_and_count_words(df_docs)
+    df_docs = filter_tokens_with_df_rules(df_docs, tokens_col="tokens")
 
-    # Token quality filter (after cleaning): drop documents with very short token lists
     df_docs = df_docs[df_docs["tokens"].apply(len) >= 5].copy()
-    print(f"Documents after token filter (>=5): {len(df_docs)}")
+    print(f"Documents kept after token+doc filtering: {len(df_docs)}")
+    print("Example tokens after filtering:", df_docs["tokens"].iloc[0][:20])
 
     print("Example cleaned document:", df_docs["content"].iloc[0][:200])
     print("Example tokens:", df_docs["tokens"].iloc[0][:20])
 
-    print("\n=== STEP 4: Train Word2Vec ===")
-    w2v_model, vocab, embedding_matrix = train_word2vec(df_docs)
+
+    print("\n=== STEP 4: Create OpenAI Embeddings ===")
+    vocab, embedding_matrix = train_openai_embeddings(df_paragraphs)
     print(f"Vocabulary size: {len(vocab)}")
 
     print("\n=== STEP 5: Cluster word embeddings (LSH sequential clustering) ===")
     ec, clusters, cluster_words_map, word_cluster_map = cluster_words(
         embedding_matrix,
-        cluster_size=50,
+        cluster_size=100,
         neighbor_alg="lsh"
     )
     print(f"Number of clusters: {len(clusters)}")
@@ -553,16 +890,24 @@ def main():
         n_topics=N_TOPICS_PER_CLUSTER,
     )
 
+    if N_TOPICS_PER_CLUSTER == 1:
+        print("\nNote: N_TOPICS_PER_CLUSTER=1, so TF2 outputs are skipped.")
+
     # Create output folder
     out_folder = "outputs_textual_factors"
     os.makedirs(out_folder, exist_ok=True)
 
     print("\n=== Saving results ===")
     tf_results["first_doc_topics_df"].to_csv(f"{out_folder}/first_doc_topics.csv", index=False)
-    tf_results["second_doc_topics_df"].to_csv(f"{out_folder}/second_doc_topics.csv", index=False)
+
+    # Only write TF2 if it exists (n_topics_per_cluster >= 2)
+    if not tf_results["second_doc_topics_df"].empty:
+        tf_results["second_doc_topics_df"].to_csv(f"{out_folder}/second_doc_topics.csv", index=False)
+
     tf_results["topics_words_df"].to_csv(f"{out_folder}/topics_words.csv", index=False)
     tf_results["singular_values_df"].to_csv(f"{out_folder}/singular_values.csv", index=False)
     tf_results["topic_importances_df"].to_csv(f"{out_folder}/topic_importances.csv", index=False)
+    export_top20_summaries(out_folder=out_folder)
 
     print("\nPipeline finished ✓")
     print("Outputs written to:", out_folder)
@@ -598,25 +943,15 @@ if __name__ == "__main__":
 #             or if the associated words are not interpretable as a clear risk theme.
 #     * This filtering is done downstream (in a separate analysis script / notebook),
 #       but it is an explicit modelling choice and should be documented in the thesis.
-#     * Drop words that are not relevant for the cluster
-#
-# - Embedding caching (optional improvement):
-#     * Word embeddings (e.g. Word2Vec or OpenAI embeddings) can be cached to disk
-#       (e.g. as a pickle file or embeddings_cache.parquet)
-#     * Avoids recomputing embeddings when iterating on clustering, LSH, or TF settings
-#     * Particularly useful when using API-based embeddings with cost or rate limits
-#     * Cache should be invalidated manually if:
-#           - preprocessing changes (stopwords, lemmatization, token filters)
-#           - document sample or page ranges change
-#           - embedding model or parameters change
-#     * Not implemented by default since current runtime is fast enough
 
 
 # Manual modelling settings / hyperparameters:
 # - Sample design:
 #     * Which banks and years are included (which PDFs in Reports/)
 #     * Which pages per PDF (page_ranges, default_pages)
-#     * Filename convention: "YYYY_<Bank>_group.pdf" (or ".pdf.pdf" variants) used to parse year and bank
+#     * Filename convention for parsing identifiers:
+#         - Expected: "YYYY_<Bank>_group.pdf" (or ".pdf.pdf" variants)
+#         - Parsed fields: year, bank (used for bank-year panel merges)
 #
 # - Text preprocessing (engine.py):
 #     * Stopword list (English)
@@ -629,24 +964,24 @@ if __name__ == "__main__":
 #     * Current rule: keep only documents where len(tokens) >= 5
 #     * Motivation: some PDF content (tables/headers) can be cleaned to empty/near-empty text
 #
-# - Word2Vec:
-#     * vector_size = 300
-#     * window = 5
-#     * min_count = 5
-#     * sg = 1 (skip-gram)
-#     * epochs = 20
-#     * seed = 42
+# - Embeddings (OpenAI):
+#     * model_name = "text-embedding-3-small"
+#     * Vocabulary built from cleaned tokens across all paragraphs (df_paragraphs)
+#     * Embeddings retrieved via OpenAI API (no local training hyperparameters)
+#     * Batch size for embedding calls: batch_size = 500
 #
 # - Neighbor search / LSH:
 #     * neighbor_alg = "lsh" (vs "brutal")
-#     * N_BITS = 128, N_TABLES = 32  (LSH hyperparameters)
+#     * N_BITS = 128, N_TABLES = 64  (FAISS LSH hyperparameters; should match tune_lsh.py output)
+#     * random_state = 42, num_queries = 1000 (NeighborFinder diagnostics)
 #
 # - Clustering:
-#     * cluster_size = 50  (target max words per cluster – implies number of clusters)
+#     * Sequential clustering (Cong et al.)
+#     * cluster_size = 50 (target words per cluster; affects number of clusters)
 #
 # - Textual factors (SVD / LSA):
 #     * cluster_type = "sequential_cluster"
-#     * n_topics = 2 per cluster (TF1 and TF2; TF2 mainly as robustness check)
+#     * N_TOPICS_PER_CLUSTER = 2 (TF1 and TF2; TF2 mainly as robustness check)
 
 
 # Note on unused functions:
@@ -665,4 +1000,4 @@ if __name__ == "__main__":
 #   Cong et al. use a simple sequential LSH-based clustering, so alternative algorithms add no value.
 
 # - Internal TextualFactors helpers (normalization/diagnostics) are not required.
-#   Only the SVD-based lsa_topics() method is needed to construct textual factors from clustered words.
+#   Only the SVD-based lsa_topics() method is needed to construct textual factors from cl

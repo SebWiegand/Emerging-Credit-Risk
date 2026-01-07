@@ -1,6 +1,0 @@
-.idea/
-__pycache__/
-*.pyc
-outputs_textual_factors/
-embedding_matrix.npy
-float.
