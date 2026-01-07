@@ -73,7 +73,7 @@ page_ranges = {
     "2021_DeutscheBank_group.pdf": range(84, 201),
     "2021_ING_group.pdf": range(45, 150),
     "2021_OPPohjola_group.pdf": range(1, 22),
-    "2021_SEB_group.pdf": range(89, 96),
+    "2021_SEB_group.pdf": range(140, 162),
     "2021_UBS_group.pdf": range(98, 150),
 
     # =========================
@@ -85,7 +85,7 @@ page_ranges = {
     "2022_DeutscheBank_group.pdf": range(90, 213),
     "2022_ING_group.pdf": range(103, 185),
     "2022_OPPohjola_group.pdf": range(1, 22),
-    "2022_SEB_group.pdf": range(82, 91),
+    "2022_SEB_group.pdf": range(145, 168),
     "2022_UBS_group.pdf": range(83, 134),
 
     # =========================
@@ -97,7 +97,7 @@ page_ranges = {
     "2023_DeutscheBank_group.pdf": range(91, 208),
     "2023_ING_group.pdf": range(131, 204),
     "2023_OPPohjola_group.pdf": range(1, 34),
-    "2023_SEB_group.pdf": range(50, 59),
+    "2023_SEB_group.pdf": range(148, 167),
     "2023_UBS_group.pdf": range(97, 153),
 
     # =========================
@@ -109,7 +109,7 @@ page_ranges = {
     "2024_DeutscheBank_group.pdf": range(91, 208),
     "2024_ING_group.pdf": range(158, 222),
     "2024_OPPohjola_group.pdf": range(40, 81),
-    "2024_SEB_group.pdf": range(50, 59),
+    "2024_SEB_group.pdf": range(260, 279),
     "2024_UBS_group.pdf": range(88, 136),
 }
 
