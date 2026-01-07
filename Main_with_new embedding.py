@@ -233,7 +233,7 @@ def preprocess_and_count_words(df):
 
 from openai import OpenAI
 client = OpenAI(
-  api_key="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")
+  api_key="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")
 def train_openai_embeddings(df):
     """
     Build word embeddings using OpenAI's text-embedding-3-small model.
