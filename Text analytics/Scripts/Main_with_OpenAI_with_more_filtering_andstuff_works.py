@@ -9,19 +9,14 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../Te
 TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
 NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
 CONG_REP_DIR = os.path.join(TEXT_ANALYTICS_DIR, "Cong et al. rep")      # .../Text analytics/Cong et al. rep
-NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
 nltk.data.path = [NLTK_DATA_DIR]
-
-
-
-
 
 for p in (CONG_REP_DIR, TEXT_ANALYTICS_DIR, SCRIPT_DIR):
     if p not in sys.path:
         sys.path.insert(0, p)
 
 
-from itertools import chain  # currently unused, but kept so you recognize it
+from itertools import chain
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -61,12 +56,8 @@ from TextualFactors import (
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
-#
 # This script lives in: <repo>/Text analytics/Scripts/
 # Reports live in:      <repo>/Text analytics/Reports/
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)  # <repo>/Text analytics
-
 reports_folder = os.path.join(TEXT_ANALYTICS_DIR, "Reports")
 print("Reports folder:", reports_folder)
 
@@ -122,9 +113,6 @@ page_ranges = {
     "2024_UBS_group.pdf": range(88, 136),
 }
 
-# IMPORTANT: No silent fallback. Every PDF must have an explicit page range.
-# If a PDF filename is not in `page_ranges`, the pipeline will stop with an error.
-default_pages = None
 
 # ============================================================
 # 0B. TOKEN / VOCAB FILTERING (IMPORTANT FOR INTERPRETABILITY)
@@ -197,10 +185,9 @@ def filter_tokens_with_df_rules(df, tokens_col="tokens", min_df=MIN_DF, max_df_r
 # ============================================================
 
 
-def load_report_paragraphs(reports_folder, page_ranges, default_pages):
+def load_report_paragraphs(reports_folder, page_ranges):
     report_paragraphs = []
     report_paragraphs_source = []
-    report_pages_source = []
 
     print(f"Looking for PDFs in: {reports_folder}")
 
@@ -249,18 +236,15 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 
                     if blocks:
                         report_paragraphs.extend(blocks)
-                        report_pages_source.extend([page_num] * len(blocks))
                         report_paragraphs_source.extend([_file] * len(blocks))
 
-    return report_paragraphs, report_paragraphs_source, report_pages_source
-
+    return report_paragraphs, report_paragraphs_source
 
 # Output:
-# After this section we have three parallel lists:
+# After this section we have two parallel lists:
 # 1) report_paragraphs        -> all extracted text paragraphs (strings)
 # 2) report_paragraphs_source -> which PDF each paragraph came from
-# 3) report_pages_source      -> which page number each paragraph came from
-# All three lists have the same length; each index represents one paragraph.
+# Both lists have the same length; each index represents one paragraph.
 
 # ============================================================
 # 2. BUILD DOCUMENT DATAFRAME
@@ -620,10 +604,9 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=1):
 
 def main():
     print("\n=== STEP 1: Load paragraphs from PDFs ===")
-    report_paragraphs, report_sources, report_pages = load_report_paragraphs(
+    report_paragraphs, report_sources = load_report_paragraphs(
         reports_folder,
-        page_ranges,
-        default_pages
+        page_ranges
     )
     print(f"Loaded {len(report_paragraphs)} paragraphs")
     if len(report_paragraphs) == 0:
