@@ -1,9 +1,27 @@
 import os
-from itertools import chain  # currently unused, but kept so you recognize it
+import sys
+import nltk
+
+# ------------------------------------------------------------
+# Directions
+# ------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../Text analytics/Scripts
+TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
+NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
+CONG_REP_DIR = os.path.join(TEXT_ANALYTICS_DIR, "Cong et al. rep")      # .../Text analytics/Cong et al. rep
+nltk.data.path = [NLTK_DATA_DIR]
+
+for p in (CONG_REP_DIR, TEXT_ANALYTICS_DIR, SCRIPT_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+
+from itertools import chain
 
 import fitz  # PyMuPDF
 import numpy as np
 import pandas as pd
+from collections import Counter
 from openai import OpenAI
 
 # Read API key from environment variable (set in PyCharm Run Configuration)
@@ -34,44 +52,69 @@ from TextualFactors import (
     transfer_topic_importances,
 )
 
+
 # ============================================================
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
-# Project root = folder where this Main_V1.py lives
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-
-# Folder with your annual reports (the Reports folder in your project)
-reports_folder = os.path.join(PROJECT_ROOT, "Reports")
-# If you prefer, you can hard-code:
-# reports_folder = "/Users/sebastianwiegandmoller/PycharmProjects/Emerging-Credit-Risk/Reports"
-
+# This script lives in: <repo>/Text analytics/Scripts/
+# Reports live in:      <repo>/Text analytics/Reports/
+reports_folder = os.path.join(TEXT_ANALYTICS_DIR, "Reports")
+print("Reports folder:", reports_folder)
 # Your own page_ranges (copied from your notebook)
+
 page_ranges = {
-    # 2024 files
-    "2024_Danske_group.pdf": range(208, 240),
-    "2024_UBS_group.pdf": range(88, 136),
-    "2024_DeutscheBank_group.pdf": range(91, 208),
-    "2024_ING_group.pdf": range(158, 222),
 
-    # 2023 files
-    "2023_Danske_group.pdf": range(175, 213),
-    "2023_UBS_group.pdf": range(97, 153),
-    "2023_DeutscheBank_group.pdf": range(91, 208),
-    "2023_ING_group.pdf": range(131, 204),
-
-    # 2022 files
-    "2022_Danske_group.pdf": range(169, 208),
-    "2022_UBS_group.pdf": range(83, 134),
-    "2022_DeutscheBank_group.pdf": range(90, 213),
-    "2022_ING_group.pdf": range(103, 185),
-
-    # 2021 files
+    # =========================
+    # 2021
+    # =========================
+    "2021_Barclays_group.pdf": range(199, 288),
+    "2021_BNPparibas_group.pdf": range(170, 192),
     "2021_Danske_group.pdf": range(159, 194),
-    "2021_UBS_group.pdf": range(98, 150),
     "2021_DeutscheBank_group.pdf": range(84, 201),
     "2021_ING_group.pdf": range(45, 150),
+    "2021_OPPohjola_group.pdf": range(1, 22),
+    "2021_SEB_group.pdf": range(140, 162),
+    "2021_UBS_group.pdf": range(98, 150),
+
+    # =========================
+    # 2022
+    # =========================
+    "2022_Barclays_group.pdf": range(263, 369),
+    "2022_BNPparibas_group.pdf": range(170, 192),
+    "2022_Danske_group.pdf": range(169, 208),  # note double .pdf as in filename
+    "2022_DeutscheBank_group.pdf": range(90, 213),
+    "2022_ING_group.pdf": range(103, 185),
+    "2022_OPPohjola_group.pdf": range(1, 22),
+    "2022_SEB_group.pdf": range(145, 168),
+    "2022_UBS_group.pdf": range(83, 134),
+
+    # =========================
+    # 2023
+    # =========================
+    "2023_Barclays_group.pdf": range(253, 362),
+    "2023_BNPparibas_group.pdf": range(166, 190),
+    "2023_Danske_group.pdf": range(175, 213),
+    "2023_DeutscheBank_group.pdf": range(91, 208),
+    "2023_ING_group.pdf": range(131, 204),
+    "2023_OPPohjola_group.pdf": range(1, 34),
+    "2023_SEB_group.pdf": range(148, 167),
+    "2023_UBS_group.pdf": range(97, 153),
+
+    # =========================
+    # 2024
+    # =========================
+    "2024_Barclays_group.pdf": range(262, 382),
+    "2024_BNPparibas_group.pdf": range(160, 184),
+    "2024_Danske_group.pdf": range(208, 240),
+    "2024_DeutscheBank_group.pdf": range(91, 208),
+    "2024_ING_group.pdf": range(158, 222),
+    "2024_OPPohjola_group.pdf": range(40, 81),
+    "2024_SEB_group.pdf": range(260, 279),
+    "2024_UBS_group.pdf": range(88, 136),
 }
+
+
 
 # Default pages if a file is not in page_ranges
 default_pages = range(0, 10)  # first 10 pages
@@ -255,8 +298,14 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
         print(f"Processed batch {i//batch_size + 1}")
 
     embedding_matrix = np.array(embeddings, dtype=np.float32)
-    np.save("../Noter/embedding_matrix.npy", embedding_matrix)
-    print("Saved embedding_matrix.npy in:", os.getcwd())
+
+    # Save embeddings in a stable location under Text analytics/Noter
+    out_dir = os.path.join(TEXT_ANALYTICS_DIR, "Noter")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "embedding_matrix.npy")
+    np.save(out_path, embedding_matrix)
+    print("Saved embedding_matrix.npy to:", out_path)
+
     return vocab, embedding_matrix
 
 
@@ -267,8 +316,8 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
 # ============================================================
 
 # ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
-N_BITS = 128    # number of hash bits = hyperplanes per table  (example)
-N_TABLES = 64   # number of hash tables                       (example)
+N_BITS = 256    # number of hash bits = hyperplanes per table  (example)
+N_TABLES = 32   # number of hash tables                       (example)
 
 # Global hyperparameter: number of LSA topics per clustera
 N_TOPICS_PER_CLUSTER = 2
@@ -524,7 +573,7 @@ def main():
     print("\n=== STEP 5: Cluster word embeddings (LSH sequential clustering) ===")
     ec, clusters, cluster_words_map, word_cluster_map = cluster_words(
         embedding_matrix,
-        cluster_size=50,
+        cluster_size=100,
         neighbor_alg="lsh"
     )
     print(f"Number of clusters: {len(clusters)}")

@@ -56,10 +56,12 @@ from TextualFactors import (
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
+
 # This script lives in: <repo>/Text analytics/Scripts/
 # Reports live in:      <repo>/Text analytics/Reports/
 reports_folder = os.path.join(TEXT_ANALYTICS_DIR, "Reports")
 print("Reports folder:", reports_folder)
+
 
 # Your own page_ranges (copied from your notebook)
 page_ranges = {
