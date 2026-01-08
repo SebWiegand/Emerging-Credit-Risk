@@ -186,7 +186,6 @@ def filter_tokens_with_df_rules(df, tokens_col="tokens", min_df=MIN_DF, max_df_r
 # 1. LOAD TEXT FROM PDF´s
 # ============================================================
 
-
 def load_report_paragraphs(reports_folder, page_ranges):
     report_paragraphs = []
     report_paragraphs_source = []
@@ -298,7 +297,6 @@ def build_document_dataframe(report_paragraphs, report_sources):
 # - year     : year parsed from filename
 # - bank     : bank parsed from filename
 
-
 # ============================================================
 # 3. CLEAN TEXT + WORD FREQUENCIES (engine.py)
 # ============================================================
@@ -330,8 +328,6 @@ def preprocess_and_count_words(df):
 # Note: We only use a subset of functions from engine.py.
 # The unused utilities (daily aggregation, long-format by date) are meant for true time-series text data,
 # but our documents are grouped by bank-year, not by calendar dates, so these functions are not needed here.
-
-
 
 # ============================================================
 # 4. OPENAI EMBEDDING FUNCTION
@@ -368,8 +364,6 @@ def train_openai_embeddings(df, model_name="text-embedding-3-small"):
     print("Saved embedding_matrix.npy to:", out_path)
 
     return vocab, embedding_matrix
-
-
 
 # ============================================================
 # 5. CLUSTER WORD EMBEDDINGS (NeighborFinder + EmbeddingCluster)
@@ -441,7 +435,6 @@ def cluster_words(
 
     return ec, clusters, cluster_words_map, word_cluster_map
 
-
 # Output:
 # - clusters : semantic word clusters
 # - word_cluster_map : tells you which cluster each word belongs to
@@ -456,9 +449,6 @@ def cluster_words(
 #
 # LSH hyperparameters (N_BITS, N_TABLES) are chosen offline in a
 # separate tuning script using their eval_index_accuracy diagnostics.
-
-
-
 
 # ============================================================
 # 6. BUILD DOCUMENT-WORD AND WORD-CLUSTER DATA FOR TEXTUAL FACTORS
@@ -498,8 +488,6 @@ def build_document_word_data(df, vocab):
 
     return doc_word_df
 
-
-
 def build_word_cluster_data(vocab, word_cluster_map):
     """
     Create a mapping:
@@ -529,7 +517,6 @@ def build_word_cluster_data(vocab, word_cluster_map):
 # ============================================================
 # 7. CONSTRUCT TEXTUAL FACTORS (SVD / LSA)
 # ============================================================
-
 
 def compute_textual_factors(document_word_data, word_cluster_data, n_topics=1):
     """
@@ -598,7 +585,6 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=1):
 # - word-level topic loadings
 # - singular values from SVD
 # - topic importance weights
-
 
 # ============================================================
 # MAIN PIPELINE
@@ -688,7 +674,6 @@ def main():
 
     print("\nPipeline finished ✓")
     print("Outputs written to:", out_folder)
-
 
 if __name__ == "__main__":
     main()
