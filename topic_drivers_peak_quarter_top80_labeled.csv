@@ -1,0 +1,7 @@
+quarter,topic,mean_abs_contrib,share,cum_share,topic_id,topic_num,topic_label
+2023Q1,topic_loading_159,5978104.423206228,0.3055045682229457,0.3055045682229457,topic_loading_159,159,"risk, threshold, challenge"
+2023Q1,topic_loading_10,4577676.1252174415,0.2339371929788048,0.5394417612017506,topic_loading_10,10,"credit, assessment, authority"
+2023Q1,topic_loading_12,2174659.2821111116,0.1111336132628236,0.6505753744645743,topic_loading_12,12,"fair, expected, eligible"
+2023Q1,topic_loading_18,1087045.9041052605,0.0555523065610964,0.7061276810256707,topic_loading_18,18,"asset, report, control"
+2023Q1,topic_loading_302,837359.9819470277,0.0427923772523696,0.7489200582780403,topic_loading_302,302,"exposure, explore, invasion"
+2023Q1,topic_loading_6,656884.6029905701,0.0335693779837496,0.7824894362617899,topic_loading_6,6,"value, total, real"
