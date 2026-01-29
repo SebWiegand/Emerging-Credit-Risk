@@ -98,7 +98,7 @@ page_ranges_2015 = {
 }
 
 page_ranges_2016 = {
-    "barclays_2016.pdf": range(133, 228),  # was LSE_BARC_2016.pdf
+    "barclays_2016.pdf": range(133, 228),  # was LSE_BARC_2016.pdfj
     "Deutsche_2016.pdf": range(88, 199),  # was NYSE_DB_2016fff.pdf
     "IDG_2016.pdf": range(54, 62),  # was NYSE_IDG_2016.pdf
     "danskebank_2016.pdf": range(135, 160),  # was danske-bank_2016.pdf
