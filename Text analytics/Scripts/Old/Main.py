@@ -1,5 +1,4 @@
 import os
-from itertools import chain  # currently unused, but kept so you recognize it
 
 import fitz  # PyMuPDF
 import numpy as np
@@ -27,13 +26,12 @@ from TextualFactors import (
 # 0. SETTINGS: folders, page ranges, etc.
 # ============================================================
 
-# Project root = folder where this Main1.py lives
+# Project root = folder where this Main_V1.py lives
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Folder with your annual reports (the Reports folder in your project)
 reports_folder = os.path.join(PROJECT_ROOT, "Reports")
-# If you prefer, you can hard-code:
-# reports_folder = "/Users/sebastianwiegandmoller/PycharmProjects/Emerging-Credit-Risk/Reports"
+
 
 # Your own page_ranges (copied from your notebook)
 page_ranges = {
@@ -98,7 +96,7 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 
                 # If None -> all pages
                 if pages_to_process is None:
-                    pages_to_process = range(total_pages)
+                    pages_to_process = range(total_pages )
 
                 # Handle possible negative page indices
                 actual_pages = []
@@ -139,27 +137,40 @@ def load_report_paragraphs(reports_folder, page_ranges, default_pages):
 
 def build_document_dataframe(report_paragraphs, report_sources):
     """
-    Turn the outputs from load_report_paragraphs into a DataFrame.
-    Each row = one paragraph (one document in our pipeline),
-    linked only to the file it came from.
+    Combine all paragraphs belonging to the same file into one document.
+    Each PDF becomes ONE document (bank × year).
+
+    Also parses bank and year from the filename so outputs
+    can be merged with bank-year panel data.
     """
-    df = pd.DataFrame(
-        {
-            "document": np.arange(len(report_paragraphs)),  # simple numeric ID
-            "content": report_paragraphs,                   # raw paragraph text
-            "file": report_sources,                         # PDF file name
-        }
+
+    df = pd.DataFrame({
+        "file": report_sources,
+        "content": report_paragraphs,
+    })
+
+    # Group paragraphs into one document per file
+    df_grouped = df.groupby("file", as_index=False)["content"].apply(
+        lambda texts: "\n".join(texts)
     )
 
-    # Make sure file column is string
-    df["file"] = df["file"].astype(str)
+    # Parse year and bank from filenames like:
+    # "2021_Danske_group.pdf" or "2021_Danske_group.pdf.pdf"
+    pattern = r"(?P<year>\d{4})_(?P<bank>.+?)_group\.pdf(?:\.pdf)?"
+    extracted = df_grouped["file"].str.extract(pattern)
 
-    # (Optional) extract year and bank from filename if you follow pattern like "2024_Danske_group.pdf"
-    # Example: "2024_Danske_group.pdf" -> year = "2024", bank = "Danske"
-    # df["year"] = df["file"].str.extract(r"(^\d{4})", expand=False)
-    # df["bank"] = df["file"].str.extract(r"^\d{4}_(.*?)_", expand=False)
+    df_grouped["year"] = extracted["year"].astype("Int64")
+    df_grouped["bank"] = extracted["bank"]
 
-    return df
+    # Sort for reproducible document IDs
+    df_grouped = df_grouped.sort_values(
+        ["year", "bank", "file"]
+    ).reset_index(drop=True)
+
+    # Stable internal document ID
+    df_grouped["document"] = np.arange(len(df_grouped))
+
+    return df_grouped
 
 # Output:
 # df with columns:
@@ -189,6 +200,7 @@ def preprocess_and_count_words(df):
     # 2) Tokenize + count word frequencies.
     #    calculate_word_frequencies expects a text column (default 'text'),
     #    so we tell it to use 'content'.
+    #    Removes stopwords
     df = calculate_word_frequencies(df, text_column="content")
 
     return df
@@ -236,11 +248,13 @@ def train_word2vec(df):
     # Train the Word2Vec model
     w2v_model = Word2Vec(
         sentences=tokenized_docs,
-        vector_size=100,  # embedding dimension (D)
+        vector_size=300,  # embedding dimension (D)
         window=5,         # context window size
         min_count=5,      # ignore words that appear fewer than 5 times
         workers=4,        # number of CPU cores to use
         sg=1,             # 1 = skip-gram, 0 = CBOW
+        seed= 42,
+        epochs=20,
     )
 
     # Get the learned word vectors
@@ -254,31 +268,49 @@ def train_word2vec(df):
         embedding_matrix[i, :] = word_vectors[w]
 
     print(f"Trained Word2Vec: {len(vocab)} words, dim={embedding_dim}")
-    return w2v_model, vocab, embedding_matrix
 
 # Output:
 # - w2v_model        : trained Word2Vec model
 # - vocab            : list of all words in the model's vocabulary
 # - embedding_matrix : 2D array with one vector per word in 'vocab'
 
+    # ------------------------------------------------------------
+    # SAVE embedding_matrix so tune_lsh.py can load it
+    # ------------------------------------------------------------
+    np.save("../../Noter/embedding_matrix.npy", embedding_matrix)
+    print("Saved embedding_matrix.npy in:", os.getcwd())
+    return w2v_model, vocab, embedding_matrix
+
+
 # ============================================================
 # 5. CLUSTER WORD EMBEDDINGS (NeighborFinder + EmbeddingCluster)
+#    using pre-tuned FAISS LSH parameters
 # ============================================================
 
+# ⚠ Set these based on your separate tuning script (e.g. tune_lsh.py)
+N_BITS = 128    # number of hash bits = hyperplanes per table
+N_TABLES = 32   # number of hash tables
 
-def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
+
+def cluster_words(
+    embedding_matrix,
+    cluster_size=50,
+    neighbor_alg="lsh",
+):
     """
     Cluster word embeddings into semantic groups.
 
     Steps:
-    1) Build a NeighborFinder (creates brute-force + LSH indices).
-    2) Build an EmbeddingCluster object.
-    3) Run sequential clustering to group similar words.
+    1) Build a NeighborFinder (creates brute-force index).
+    2) If neighbor_alg == "lsh", create an LSH index with pre-tuned
+       (N_BITS, N_TABLES) and attach it to the NeighborFinder.
+    3) Build an EmbeddingCluster object.
+    4) Run sequential clustering to group similar words.
 
     Inputs:
     - embedding_matrix : numpy array (V x D) from Word2Vec
     - cluster_size     : approx. number of words per cluster
-    - neighbor_alg     : "lsh" (fast) or "brutal" (exact)
+    - neighbor_alg     : "lsh" (fast, uses FAISS LSH) or "brutal" (exact)
 
     Outputs:
     - ec                : EmbeddingCluster object
@@ -287,17 +319,27 @@ def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
     - word_cluster_map  : word index → cluster ID mapping
     """
 
-    # 1) Build LSH + brute-force neighbor search engine
+    # 1) Build neighbor search engine (brute-force index always built inside)
     nf = NeighborFinder(
         embedding_matrix,
         random_state=42,
-        num_queries=1000   # evaluates LSH accuracy
+        num_queries=1000,   # used for their internal diagnostics if needed
     )
 
-    # 2) Create clustering engine using chosen neighbor algorithm
+    # 2) If we use LSH, create the FAISS LSH index with tuned parameters
+    if neighbor_alg == "lsh":
+        print(
+            f"Using FAISS LSH with tuned parameters: "
+            f"bits={N_BITS}, tables={N_TABLES}"
+        )
+        nf.lsh_index = nf.create_lsh_index(N_BITS, N_TABLES)
+    else:
+        print("Using brute-force neighbor search (no LSH).")
+
+    # 3) Create clustering engine using chosen neighbor algorithm
     ec = EmbeddingCluster(nf, neighbor_alg=neighbor_alg)
 
-    # 3) Perform clustering (Cong et al.'s sequential clustering)
+    # 4) Perform clustering (Cong et al.'s sequential clustering)
     clusters = ec.sequentialcluster(cluster_size=cluster_size)
 
     # Map clusters <-> words
@@ -307,74 +349,23 @@ def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
 
     return ec, clusters, cluster_words_map, word_cluster_map
 
-# Output:
-# - clusters : semantic word clusters
-# - word_cluster_map : tells you which cluster each word belongs to
-# - cluster_words_map : tells you which words are in each cluster
-
-
-
-# ============================================================
-# 5. CLUSTER WORD EMBEDDINGS (NeighborFinder + EmbeddingCluster)
-# ============================================================
-
-from TextualFactors import NeighborFinder, EmbeddingCluster
-
-def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
-    """
-    Cluster word embeddings into semantic groups.
-
-    Steps:
-    1) Build a NeighborFinder (creates brute-force + LSH indices).
-    2) Build an EmbeddingCluster object.
-    3) Run sequential clustering to group similar words.
-
-    Inputs:
-    - embedding_matrix : numpy array (V x D) from Word2Vec
-    - cluster_size     : approx. number of words per cluster
-    - neighbor_alg     : "lsh" (fast) or "brutal" (exact)
-
-    Outputs:
-    - ec                : EmbeddingCluster object
-    - clusters          : list of clusters (each cluster = list of word indices)
-    - cluster_words_map : cluster → words mapping
-    - word_cluster_map  : word index → cluster ID mapping
-    """
-
-    # 1) Build LSH + brute-force neighbor search engine
-    nf = NeighborFinder(
-        embedding_matrix,
-        random_state=42,
-        num_queries=1000   # evaluates LSH accuracy
-    )
-
-    # 2) Create clustering engine using chosen neighbor algorithm
-    ec = EmbeddingCluster(nf, neighbor_alg=neighbor_alg)
-
-    # 3) Perform clustering (Cong et al.'s sequential clustering)
-    clusters = ec.sequentialcluster(cluster_size=cluster_size)
-
-    # Map clusters <-> words
-    cluster_words_map, word_cluster_map = ec.cluster_word_map(clusters)
-
-    print(f"Number of clusters created: {len(clusters)}")
-
-    return ec, clusters, cluster_words_map, word_cluster_map
 
 # Output:
 # - clusters : semantic word clusters
 # - word_cluster_map : tells you which cluster each word belongs to
 # - cluster_words_map : tells you which words are in each cluster
-
-# Note:
-# In this project we only use the essential parts of NeighborFinder and EmbeddingCluster:
-# - NeighborFinder.__init__() to build LSH / brute-force indices
-# - EmbeddingCluster.sequentialcluster() for semantic clustering
-# - cluster_word_map() to map words to clusters
 #
-# Other methods (e.g., eval_index_accuracy, optimize_lsh_hyperparameters,
-# heuristic_cluster, hierarchical_cluster) are advanced or experimental tools
-# that are not needed for the standard textual factors pipeline.
+# Note:
+# We rely on Cong et al.'s NeighborFinder and EmbeddingCluster:
+# - NeighborFinder.__init__() to build LSH / brute-force indices
+# - NeighborFinder.create_lsh_index() for FAISS LSH construction
+# - EmbeddingCluster.sequentialcluster() for semantic clustering
+# - EmbeddingCluster.cluster_word_map() to map words to clusters
+#
+# LSH hyperparameters (N_BITS, N_TABLES) are chosen offline in a
+# separate tuning script using their eval_index_accuracy diagnostics.
+
+
 
 
 # ============================================================
@@ -384,24 +375,22 @@ def cluster_words(embedding_matrix, cluster_size=50, neighbor_alg="lsh"):
 def build_document_word_data(df, vocab):
     """
     Create a long-format table with:
-    - document (paragraph ID)
+    - document (document ID)
     - ngram (word)
     - count (frequency of the word in that document)
-
-    This is the format expected by TextualFactors.
     """
 
     rows = []
+    vocab_set = set(vocab)
 
-    # df["word_freq"] is a dict: word → count for each paragraph/document
     for doc_id, word_counts in zip(df["document"], df["word_freq"]):
         for word, count in word_counts.items():
-            if word in vocab:  # keep only words that exist in the embedding model
+            if word in vocab_set:
                 rows.append(
                     {
                         "document": doc_id,
                         "ngram": word,
-                        "count": int(count)
+                        "count": int(count),
                     }
                 )
 
@@ -507,6 +496,9 @@ def compute_textual_factors(document_word_data, word_cluster_data, n_topics=2):
 # - topic importance weights
 
 
+# Global hyperparameter: number of LSA topics per cluster
+N_TOPICS_PER_CLUSTER = 2
+
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
@@ -526,8 +518,13 @@ def main():
 
     print("\n=== STEP 3: Clean text + tokenize + count words ===")
     df_docs = preprocess_and_count_words(df_docs)
-    print("Example cleaned document:", df_docs['content'].iloc[0][:200])
-    print("Example tokens:", df_docs['tokens'].iloc[0][:20])
+
+    # Token quality filter (after cleaning): drop documents with very short token lists
+    df_docs = df_docs[df_docs["tokens"].apply(len) >= 5].copy()
+    print(f"Documents after token filter (>=5): {len(df_docs)}")
+
+    print("Example cleaned document:", df_docs["content"].iloc[0][:200])
+    print("Example tokens:", df_docs["tokens"].iloc[0][:20])
 
     print("\n=== STEP 4: Train Word2Vec ===")
     w2v_model, vocab, embedding_matrix = train_word2vec(df_docs)
@@ -549,7 +546,11 @@ def main():
     print(word_cluster_data.head())
 
     print("\n=== STEP 7: Compute Textual Factors (SVD / LSA) ===")
-    tf_results = compute_textual_factors(document_word_data, word_cluster_data)
+    tf_results = compute_textual_factors(
+        document_word_data,
+        word_cluster_data,
+        n_topics=N_TOPICS_PER_CLUSTER,
+    )
 
     # Create output folder
     out_folder = "outputs_textual_factors"
@@ -569,8 +570,82 @@ def main():
 if __name__ == "__main__":
     main()
 
+# Improvements:
+# - Cluster size:
+#     * Currently cluster_size = 50, which yields ~600 small clusters (≈5–6 words each).
+#     * Possible improvement: run a small sensitivity analysis on cluster_size
+#       (e.g. 30, 50, 80) and see how robust the main TFs are.
+#
+# - Ingestion of documents:
+#     * Filenames must follow the pattern "YYYY_<Bank>_group.pdf" (or .pdf.pdf as now),
+#       because year/bank are parsed from the name.
+#     * page_ranges keys must match the exact filenames in Reports/.
+#       If the naming convention changes, update both the regex in
+#       build_document_dataframe() and the page_ranges dict.
+#
+# - Number of topics per cluster:
+#     * Currently N_TOPICS_PER_CLUSTER = 2 (TF1 + TF2 as a robustness check).
+#     * For the final empirical analysis, consider using only TF1
+#       (set N_TOPICS_PER_CLUSTER = 1) and treat TF2 as diagnostics.
+#
+# - Filtering clusters and topics:
+#     * Not all clusters / topics will be relevant economically.
+#     * After running the pipeline, use topic_importances.csv and singular_values.csv
+#       to filter out weak or noisy components:
+#           - Drop clusters where overall topic_importance is very low.
+#           - Optionally drop TF2 if its singular value is much smaller than TF1
+#             or if the associated words are not interpretable as a clear risk theme.
+#     * This filtering is done downstream (in a separate analysis script / notebook),
+#       but it is an explicit modelling choice and should be documented in the thesis.
+#     * Drop words that are not relevant for the cluster
+#
+# - Embedding caching (optional improvement):
+#     * Word embeddings (e.g. Word2Vec or OpenAI embeddings) can be cached to disk
+#       (e.g. as a pickle file or embeddings_cache.parquet)
+#     * Avoids recomputing embeddings when iterating on clustering, LSH, or TF settings
+#     * Particularly useful when using API-based embeddings with cost or rate limits
+#     * Cache should be invalidated manually if:
+#           - preprocessing changes (stopwords, lemmatization, token filters)
+#           - document sample or page ranges change
+#           - embedding model or parameters change
+#     * Not implemented by default since current runtime is fast enough
 
 
+# Manual modelling settings / hyperparameters:
+# - Sample design:
+#     * Which banks and years are included (which PDFs in Reports/)
+#     * Which pages per PDF (page_ranges, default_pages)
+#     * Filename convention: "YYYY_<Bank>_group.pdf" (or ".pdf.pdf" variants) used to parse year and bank
+#
+# - Text preprocessing (engine.py):
+#     * Stopword list (English)
+#     * Lemmatization (WordNetLemmatizer)
+#     * Removal of digits and punctuation
+#     * Currently unigrams only (no bigrams yet)
+#
+# - Token quality filter (main pipeline):
+#     * Report-level documents are filtered after cleaning
+#     * Current rule: keep only documents where len(tokens) >= 5
+#     * Motivation: some PDF content (tables/headers) can be cleaned to empty/near-empty text
+#
+# - Word2Vec:
+#     * vector_size = 300
+#     * window = 5
+#     * min_count = 5
+#     * sg = 1 (skip-gram)
+#     * epochs = 20
+#     * seed = 42
+#
+# - Neighbor search / LSH:
+#     * neighbor_alg = "lsh" (vs "brutal")
+#     * N_BITS = 128, N_TABLES = 32  (LSH hyperparameters)
+#
+# - Clustering:
+#     * cluster_size = 50  (target max words per cluster – implies number of clusters)
+#
+# - Textual factors (SVD / LSA):
+#     * cluster_type = "sequential_cluster"
+#     * n_topics = 2 per cluster (TF1 and TF2; TF2 mainly as robustness check)
 
 
 # Note on unused functions:
@@ -590,4 +665,3 @@ if __name__ == "__main__":
 
 # - Internal TextualFactors helpers (normalization/diagnostics) are not required.
 #   Only the SVD-based lsa_topics() method is needed to construct textual factors from clustered words.
-

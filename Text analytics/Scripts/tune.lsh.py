@@ -14,14 +14,32 @@ Usage:
 """
 
 import os
+import sys
 import numpy as np
-from TextualFactors import NeighborFinder
+
+# Ensure project modules are importable when running from Scripts/
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
+CONG_REP_DIR = os.path.join(TEXT_ANALYTICS_DIR, "Cong et al. rep")
+
+# Add likely module roots to sys.path
+for p in (CONG_REP_DIR, TEXT_ANALYTICS_DIR, SCRIPT_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+try:
+    from TextualFactors import NeighborFinder
+except ModuleNotFoundError as e:
+    print("Could not import TextualFactors. sys.path is:")
+    for p in sys.path[:10]:
+        print("  -", p)
+    raise
 
 
 # ============================================================
 # 1. Load the embedding matrix
 # ============================================================
-embedding_matrix_path = "../Noter/embedding_matrix.npy"  # adjust if saved elsewhere
+embedding_matrix_path = os.path.join(TEXT_ANALYTICS_DIR, "outputs_textual_factors", "embedding_matrix.npy")
 
 print(f"Loading embeddings from: {embedding_matrix_path}")
 if not os.path.exists(embedding_matrix_path):
@@ -48,7 +66,7 @@ print("NeighborFinder initialized.")
 
 # ============================================================
 # 3. Use THEIR hyperparameter optimizer
-# ==============================================a==============
+# ============================================================
 # Note: optimize_lsh_hyperparameters internally:
 #   - loops over bits & tables
 #   - creates LSH indices
@@ -58,8 +76,9 @@ print("NeighborFinder initialized.")
 # Important: Their accuracy metric is very strict, so realistic targets
 # are low (e.g. 0.03–0.06). Here we use 0.06 and cut off max_trials to
 # avoid huge indexes that might crash FAISS.
-target_accuracy = 0.99
-max_trials = 8   # don't go beyond 2**8 bits per table
+# Realistic targets for Cong et al.'s strict accuracy metric are low (e.g. 0.03–0.06)
+target_accuracy = 0.97
+max_trials = 8   # keep search small to avoid huge indices
 k_eval = 2       # matches their default k=2
 
 print(
