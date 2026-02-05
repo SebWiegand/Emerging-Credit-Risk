@@ -15,7 +15,7 @@ import os, glob #help find CSV file automatically, if not defined already
 # ---------------------------
 # CONFIGURATION
 # ---------------------------
-CSV_PATH = "data2.csv"  # If None, auto-detects largest .csv in current directive
+CSV_PATH = "data2_Original.csv"  # If None, auto-detects largest .csv in current directive
 RANDOM_SEED = 42 #ensures random dummy exposures are reproducible
 N_DUMMY_EXPOSURES = 3 #number of placeholder risk exposures to create
 MIN_DAYS_PER_QUARTER = 20 #minimum trading days per quarter to include bank in analysis

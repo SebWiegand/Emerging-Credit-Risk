@@ -1,28 +1,49 @@
-# emerging_risk_panel.py
-# ----------------------------------------------------------
-# Builds quarterly bank-pair panel, constructs controls, adds
-# placeholder (dummy) risk exposures, runs per-quarter regressions,
-# and outputs adjusted R² series ("emerging risk index"), and plot of z-score comapred to baseline (93-03).
-# ----------------------------------------------------------
+# emerging_risk_panel_continued.py
+# -----------------------------------------------------------------------------
+# PURPOSE
+#   Build a quarterly *bank-pair* panel from daily equity data and annual
+#   disclosure-based topic exposures. For each quarter t we:
+#     1) compute return covariance for every bank-pair (i, j)
+#     2) build controls (size/turnover/volatility + same sector/country/currency)
+#     3) add exposure-similarity terms based on text topics
+#     4) run two regressions (controls-only vs controls+exposures)
+#     5) define an "Emerging Risk Index" as ΔAdj.R² = AdjR²(full) − AdjR²(controls)
+#        and standardize it relative to a baseline period.
+#   Then we attribute the peak-quarter spike to the topics that contribute most,
+#   and optionally generate human-readable topic labels via OpenAI.
+# -----------------------------------------------------------------------------
 
-import pandas as pd #read and manipulate the data
-import numpy as np #numerical operations (log returns, covariances)
-from itertools import combinations #create all pairs of banks (i,j)
-import statsmodels.api as sm #run regressions (OLS, get adjusted R²)
-import matplotlib.pyplot as plt #make the “emerging risk index” plot
-import os, glob #help find CSV file automatically, if not defined already
+# -----------------------------------------------------------------------------
+# Libraries
+#   pandas/numpy: data wrangling and numerical work (returns, covariances)
+#   itertools: generate all bank pairs (i, j)
+#   statsmodels: per-quarter OLS regressions and adjusted R²
+#   matplotlib: plots
+#   os/glob: filesystem paths and optional CSV auto-detection
+#   json/ast/re: parsing topic-word files and building API payloads
+# -----------------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+from itertools import combinations
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import os, glob
 import math
-
-# Add json import if not already present
 import json
 
 # ---------------------------
 # CONFIGURATION
 # ---------------------------
-CSV_PATH = "data2.csv"  # daily market data
+# Input daily market data (Compustat security daily collapsed to firm-level later)
+CSV_PATH = "data2_Original.csv"  # daily market data
+# Minimum number of daily returns within a quarter required to compute reliable
+# volatility/covariance. Quarters with fewer observations are dropped.
 MIN_DAYS_PER_QUARTER = 20  # minimum trading days per quarter to include bank in analysis
 
-# --- Text-topic inputs (annual reports) ---
+# Annual-report inputs used to construct quarterly topic exposures.
+# Reports are expected to be named like: YEAR_FIRM_*.pdf (e.g. 2021_UBS_group.pdf)
+# The topic model output (first_doc_topics.csv) must contain a 'document' column
+# plus one column per topic loading.
 REPORTS_DIR = "Reports"  # folder containing YEAR_FIRM_*.pdf (relative to this script)
 # Document-topic loadings output (relative to this script)
 # NOTE: folder name is 'putputs_textual_factors' in your project.
@@ -36,14 +57,14 @@ FIRM_TO_GVKEY = {
     "UBS": "144496",
 }
 
-# If text-topic inputs are missing, we fall back to dummy exposures so the script can still run.
-RANDOM_SEED = 42
-N_DUMMY_EXPOSURES = 3
-
-np.random.seed(RANDOM_SEED) #Ensures all random numbers (e.g. dummy exposures) are consistent if the script is rerun.
 
 # below function auto-detects CSV file if none specified
 def detect_csv():
+    """If CSV_PATH is empty, pick the largest CSV in the current folder.
+
+    This is just a convenience for interactive work. In production runs you
+    should set CSV_PATH explicitly.
+    """
     files = glob.glob("*.csv")
     if not files:
         raise FileNotFoundError("No CSV files found. Place your CSV in this folder.")
@@ -54,18 +75,34 @@ def detect_csv():
 if not CSV_PATH:
     CSV_PATH = detect_csv()
 
-# ---------------------------
+#
 # TEXT: BUILD BANK-YEAR TOPIC EXPOSURES FROM first_doc_topics.csv + report filenames
-# ---------------------------
+#
 def build_quarterly_topic_panel(base_dir: str) -> tuple[pd.DataFrame, list[str]]:
-    """Returns (topics_q, topic_cols).
+    """Build quarterly topic exposures from annual reports.
 
-    topics_q has columns: gvkey (str), quarter (Period[Q]), topic_*.
-    The topic_* values are carried forward within each gvkey based on report year.
+    Returns
+    -------
+    (topics_fy, topic_cols)
+      topics_fy: DataFrame with columns [gvkey, quarter, topic_*]
+        Each row is a firm (gvkey) and the *report year anchored at Q1*.
+        Exposures are later carried forward to each quarter using merge_asof
+        (i.e., each quarter inherits the most recent available annual disclosure).
+      topic_cols: list of topic-loading column names.
 
-    Requirements:
-    - Reports live in REPORTS_DIR with names like YEAR_FIRM_*.pdf
-    - FIRST_DOC_TOPICS_PATH exists and has a 'document' column plus topic columns.
+    Key idea
+    --------
+    first_doc_topics.csv is indexed by an integer document id. We reconstruct
+    the same document order by sorting filenames in REPORTS_DIR and assigning
+    doc_id = 0..N-1. Each filename provides:
+      - year (from YEAR_...)
+      - firm token (from _FIRM_...)
+    which we map to a Compustat gvkey via FIRM_TO_GVKEY.
+
+    Requirements
+    ------------
+    - Reports live in REPORTS_DIR and follow YEAR_FIRM_*.pdf naming.
+    - FIRST_DOC_TOPICS_PATH exists and contains 'document' + topic columns.
     """
     reports_path = os.path.join(base_dir, REPORTS_DIR)
     # FIRST_DOC_TOPICS_PATH may already be a relative path (e.g., subfolder/file)
@@ -138,6 +175,9 @@ def build_quarterly_topic_panel(base_dir: str) -> tuple[pd.DataFrame, list[str]]
 
     return fy, topic_cols
 
+# Output of this section: raw daily issue-level data (df) with correct dtypes.
+# [gvkey, quarter(=YYYYQ1), topic_1, topic_2, ...]
+
 # ---------------------------
 # 1) LOAD DATA
 # ---------------------------
@@ -147,6 +187,9 @@ for col in ['cshoc','cshtrd','prccd','prchd','prcld']: #ensure numeric types
     if col in df.columns: #check column exists
         df[col] = pd.to_numeric(df[col], errors='coerce') #convert to numeric, coerce errors to NaN
 
+#
+# Output of this section: one row per (gvkey, datadate) with a single firm-level
+# price/volume series, preferring the primary issue when identifiable.
 # ---------------------------
 # 2) COLLAPSE TO FIRM-LEVEL DAILY PRICE  (prirow is the IID, e.g., "04W")
 # ---------------------------
@@ -174,7 +217,9 @@ def collapse_firm_daily(group):
                 'curcdd': g['curcdd'].iloc[0]
             })
 
-    # Fallback (if no cshoc): market-cap-weighted average across issues for that firm-day. i.e., weighted average price by cshoc (number of shares outstanding)
+    # Fallback if we cannot confidently identify the primary issue:
+    # We collapse multiple listed issues into a single firm-level series by taking
+    # a market-cap-weighted average price using shares outstanding (cshoc) as weights.
     g = group.copy()
     w = g['cshoc'].replace(0, np.nan)
     if w.notna().any() and w.sum() > 0:
@@ -207,7 +252,9 @@ collapsed = (
 m = df['prirow'].notna() & (df['iid'].astype(str).str.strip() == df['prirow'].astype(str).str.strip()) #boolean Series where prirow matches iid
 mismatch_rate = 1 - m.mean() #compute share of rows where prirow matches iid
 print("Share of rows where prirow != iid (expected; prirow is sparse / issue-level):", mismatch_rate)
+# Note: a high mismatch rate is expected because prirow is often missing and is an issue-level attribute.
 
+# Output of this section: daily log returns per firm and a quarter identifier.
 # ---------------------------
 # 3) COMPUTE RETURNS & QUARTERS
 # ---------------------------
@@ -229,6 +276,8 @@ collapsed = collapsed.drop(columns='log_price') #drop log_price column
 collapsed['quarter'] = collapsed['datadate'].dt.to_period('Q') #compute quarter identifier
 collapsed['mktcap'] = collapsed['prccd_firm'] * collapsed['cshoc_firm'] #compute market cap (used later for size calculation)
 
+# Output of this section: bank_quarter panel with size/turnover/volatility and
+# identifiers (sector/country/currency) computed from daily data.
 # ---------------------------
 # 4) QUARTERLY BANK CONTROLS
 # ---------------------------
@@ -250,8 +299,12 @@ bank_quarter = bank_quarter[bank_quarter['n_days'] >= MIN_DAYS_PER_QUARTER].copy
 bank_quarter['size'] = np.log(bank_quarter['avg_mktcap'].replace({0: np.nan})) #log size (market cap).
 bank_quarter['turnover'] = (bank_quarter['turnover'] / bank_quarter['shares']).replace([np.inf,-np.inf], np.nan) #turnover ratio
 
+#
+# Output of this section: bank_quarter augmented with disclosure-based topic
+# exposures (required), and then lagged by one quarter so exposures at t-1 explain
+# covariances at t.
 # ---------------------------
-# 5) EXPOSURES: REAL TOPICS (preferred) OR PLACEHOLDER DUMMIES (fallback)
+# 5) EXPOSURES: DISCLOSURE-BASED TOPIC LOADINGS (REQUIRED)
 # ---------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -261,62 +314,51 @@ topics_fy, topic_cols = build_quarterly_topic_panel(BASE_DIR)
 # Ensure types for merge
 bank_quarter["gvkey"] = bank_quarter["gvkey"].astype(str)
 
-if not topics_fy.empty:
-    topics_fy["gvkey"] = topics_fy["gvkey"].astype(str)
-
-    # merge_asof requires the 'on' key to be globally sorted.
-    # Sort primarily by the timestamp key, then by gvkey.
-    bank_quarter = bank_quarter.copy()
-    topics_fy = topics_fy.copy()
-
-    bank_quarter["_qts"] = bank_quarter["quarter"].dt.to_timestamp()
-    topics_fy["_qts"] = topics_fy["quarter"].dt.to_timestamp()
-
-    bank_quarter = bank_quarter.dropna(subset=["_qts"]).sort_values(["_qts", "gvkey"]).reset_index(drop=True)
-    topics_fy = topics_fy.dropna(subset=["_qts"]).sort_values(["_qts", "gvkey"]).reset_index(drop=True)
-
-    if not bank_quarter["_qts"].is_monotonic_increasing:
-        raise ValueError("bank_quarter _qts is not globally sorted ascending; merge_asof requires this")
-    if not topics_fy["_qts"].is_monotonic_increasing:
-        raise ValueError("topics_fy _qts is not globally sorted ascending; merge_asof requires this")
-
-    bank_quarter = pd.merge_asof(
-        bank_quarter,
-        topics_fy.drop(columns=["quarter"]),
-        by="gvkey",
-        on="_qts",
-        direction="backward",
+if topics_fy.empty:
+    raise FileNotFoundError(
+        "[TEXT] Required topic inputs not found or empty. "
+        "Ensure Reports/ exists and outputs_textual_factors/first_doc_topics.csv exists and matches the report order."
     )
 
-    # Restore original quarter column and drop helper
-    bank_quarter = bank_quarter.rename(columns={"_qts": "quarter_ts"})
+# From here on we assume real disclosure-based topics exist.
+topics_fy["gvkey"] = topics_fy["gvkey"].astype(str)
 
-    # If any topic columns are still missing (e.g., early years before first report), fill with 0
-    for c in topic_cols:
-        if c in bank_quarter.columns:
-            bank_quarter[c] = pd.to_numeric(bank_quarter[c], errors="coerce").fillna(0.0)
+# merge_asof requires the 'on' key to be globally sorted.
+# Sort primarily by the timestamp key, then by gvkey.
+bank_quarter = bank_quarter.copy()
+topics_fy = topics_fy.copy()
 
-    print(f"Merged {len(topic_cols)} topic exposure columns from disclosures.")
-    exposure_cols = topic_cols
+bank_quarter["_qts"] = bank_quarter["quarter"].dt.to_timestamp()
+topics_fy["_qts"] = topics_fy["quarter"].dt.to_timestamp()
 
-else:
-    print("[TEXT] Falling back to dummy exposures (see [TEXT] path checks above).")
+bank_quarter = bank_quarter.dropna(subset=["_qts"]).sort_values(["_qts", "gvkey"]).reset_index(drop=True)
+topics_fy = topics_fy.dropna(subset=["_qts"]).sort_values(["_qts", "gvkey"]).reset_index(drop=True)
 
-    def stable_randoms(keys, n_cols, seed=42):
-        uniques = pd.unique(keys)
-        mat = {}
-        for k in uniques:
-            local_seed = abs(hash((str(k), seed))) % (2**32 - 1)
-            mat[k] = np.random.default_rng(local_seed).random(n_cols)
-        arr = np.vstack([mat[k] for k in keys])
-        return arr
+if not bank_quarter["_qts"].is_monotonic_increasing:
+    raise ValueError("bank_quarter _qts is not globally sorted ascending; merge_asof requires this")
+if not topics_fy["_qts"].is_monotonic_increasing:
+    raise ValueError("topics_fy _qts is not globally sorted ascending; merge_asof requires this")
 
-    keys = bank_quarter['gvkey'].astype(str) + "_" + bank_quarter['quarter'].astype(str)
-    exposures = stable_randoms(keys, N_DUMMY_EXPOSURES, seed=RANDOM_SEED)
-    for k in range(N_DUMMY_EXPOSURES):
-        bank_quarter[f'exp{k+1}'] = exposures[:,k]
+# Economic interpretation: each quarter uses the most recent available annual
+# disclosure topics for that bank (carried forward until the next report).
+bank_quarter = pd.merge_asof(
+    bank_quarter,
+    topics_fy.drop(columns=["quarter"]),
+    by="gvkey",
+    on="_qts",
+    direction="backward",
+)
 
-    exposure_cols = [f'exp{i+1}' for i in range(N_DUMMY_EXPOSURES)]
+# Restore original quarter column and drop helper
+bank_quarter = bank_quarter.rename(columns={"_qts": "quarter_ts"})
+
+# If any topic columns are still missing (e.g., early years before first report), fill with 0
+for c in topic_cols:
+    if c in bank_quarter.columns:
+        bank_quarter[c] = pd.to_numeric(bank_quarter[c], errors="coerce").fillna(0.0)
+
+print(f"Merged {len(topic_cols)} topic exposure columns from disclosures.")
+exposure_cols = topic_cols
 
 # Lag by one quarter
 def lag_by_quarter(df_bq):
@@ -340,6 +382,8 @@ if "quarter_ts" in bank_quarter.columns:
     bank_quarter = bank_quarter.drop(columns=["quarter_ts"])
 bank_quarter.to_csv("panel_bank_quarter.csv", index=False)
 
+# Output of this section: pairs DataFrame with one row per bank-pair (i, j) per
+# quarter, containing the within-quarter covariance of daily returns.
 # ---------------------------
 # 6) PAIRWISE COVARIANCES
 # ---------------------------
@@ -361,6 +405,8 @@ for q, qdf in daily_q.groupby('quarter'): #for each quarter
         pair_rows.append({'quarter':q, 'gvkey_i':i, 'gvkey_j':j, 'cov_ij':cov_ij}) #store result
 pairs = pd.DataFrame(pair_rows) #create DataFrame from pairwise covariance rows
 
+# Output of this section: regression-ready pair panel including products of
+# lagged controls/exposures and same-sector/country/currency indicators.
 # ---------------------------
 # 7) MERGE CONTROLS, BUILD REGR DATA
 # ---------------------------
@@ -379,7 +425,7 @@ new_cols = {}
 for base in ['size', 'turnover', 'vol']:
     new_cols[f'{base}_prod_lag1'] = pairs[f'{base}_lag1_i'] * pairs[f'{base}_lag1_j']
 
-# Products of lagged exposures (topics or dummy exp*)
+# Products of lagged topic exposures
 for base in exposure_cols:
     new_cols[f'{base}_prod_lag1'] = pairs[f'{base}_lag1_i'] * pairs[f'{base}_lag1_j']
 
@@ -393,6 +439,8 @@ pairs = pairs.dropna(subset=['cov_ij']+[c for c in pairs.columns if c.endswith('
 pairs = pairs.copy()  # defragment for downstream performance
 pairs.to_csv("panel_pairs_quarter.csv", index=False) #save pairs-quarter panel
 
+# Output of this section: per-quarter adjusted R² for controls vs full model,
+# plus topic attribution (betas and contribution-based importance).
 # ---------------------------
 # 8) PER-QUARTER REGRESSIONS
 # ---------------------------
@@ -438,6 +486,8 @@ for q, qdf in pairs.groupby('quarter'): #for each quarter
 
         X_topics = qdf[exposure_vars]
         contrib = X_topics.mul(betas, axis=1)
+        # mean_abs_contrib is a simple magnitude measure: average over pairs of |beta_k * x_k|.
+        # It ranks which topics matter most *in this quarter* for explaining covariances.
         imp = contrib.abs().mean(axis=0)
 
         for v, val in imp.items():
@@ -461,6 +511,8 @@ if topic_coef_rows:
 if topic_contrib_rows:
     pd.DataFrame(topic_contrib_rows).to_csv("topic_contrib_by_quarter.csv", index=False)
 
+# Output of this section: plots and a standardized Emerging Risk Index (z-score)
+# based on ΔAdj.R² relative to the chosen baseline period.
 # ---------------------------
 # 9) PLOT EMERGING RISK INDEX (z-score of ΔAdj. R²)
 # ---------------------------
@@ -536,6 +588,9 @@ if peak_q is not None and topic_contrib_rows:
         f"top 80% contributors -> topic_drivers_peak_quarter_top80.csv"
     )
 
+# Output of this section: labeled topic-driver tables for the peak quarter.
+# First we label with top words; optionally we call OpenAI to propose semantic
+# labels (e.g., "Funding stress", "Climate transition risk").
 # --------------------------------------------------
 # 10) LABEL TOP-80 TOPICS USING TOPIC WORDS FILE
 # --------------------------------------------------
@@ -719,6 +774,8 @@ if os.path.isfile(TOPIC_WORDS_PATH) and os.path.isfile("topic_drivers_peak_quart
 else:
     print("[LABEL] Skipped topic labeling (topics_words.csv or top80 file not found)")
 
+#
+# This bar-style time series is the presentation-friendly version used to highlight "spikes".
 # Plot the standardized Emerging Risk Index (histogram-style time series, like in the article)
 quarters = pd.PeriodIndex(res_df['quarter'], freq='Q').to_timestamp()
 z_vals = res_df['z_score']
