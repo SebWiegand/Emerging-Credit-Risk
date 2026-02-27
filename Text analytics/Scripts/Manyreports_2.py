@@ -9,7 +9,7 @@ import pandas as pd
 from collections import Counter
 from openai import OpenAI
 
-# Read API key from environment variable (set in PyCharm Run Configuration)
+# Read API key from environment variable (set in PyCharm Run Configuration).
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if OPENAI_API_KEY is None:
     raise RuntimeError(
