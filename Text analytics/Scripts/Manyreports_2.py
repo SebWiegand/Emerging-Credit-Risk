@@ -19,9 +19,9 @@ if OPENAI_API_KEY is None:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ------------------------------------------------------------
+# -----------------------------------------------------------
 # Directions
-# ------------------------------------------------------------
+# -----------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../Text analytics/Scripts
 TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
 NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
