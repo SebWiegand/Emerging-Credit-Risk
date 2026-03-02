@@ -2,14 +2,14 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-PATH = "outputs_textual_factors/extraction_summary_ALL.csv"  # change if needed
+PATH = "extraction_summary_ALL_V1.csv"  # change if needed
 df = pd.read_csv(PATH)
 
 # --- choose how to aggregate across banks within a year ---
 AGG = "mean"   # "mean" or "median"
 
 # --- Plot average topic loadings by year ---
-TOPICS = [172, 186,]  # keep unique topics only
+TOPICS = [197]  # keep unique topics only
 
 # Build column names
 topic_cols = [f"topic_loading_{t}" for t in TOPICS]
