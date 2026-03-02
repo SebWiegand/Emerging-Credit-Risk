@@ -21,7 +21,7 @@ MIN_DOC_TOKENS = 5                 # drop documents with fewer tokens than this 
 
 # --- Text preprocessing ---
 TOKEN_MIN_LEN = 3                  # drop tokens shorter than this
-MIN_DF = 5                         # token must appear in at least MIN_DF documents
+MIN_DF = 10                         # token must appear in at least MIN_DF documents
 EXTRA_DROP_WORDS = {
     # Generic report boilerplate
     "annual", "report", "reports", "group", "plc", "page", "pages", "section", "chapter",
@@ -44,7 +44,7 @@ EMBEDDING_BATCH_SIZE = 200
 N_BITS = 256
 N_TABLES = 32
 NEIGHBOR_ALG = "lsh"               # "lsh" or "brute"
-TARGET_CLUSTER_SIZE = 50           # target / soft cap for words per cluster
+TARGET_CLUSTER_SIZE = 100           # target / soft cap for words per cluster
 
 # --- Textual Factors / SVD ---
 N_TOPICS_PER_CLUSTER = 1           # 1 or 2
@@ -674,7 +674,7 @@ def train_openai_embeddings(df, model_name: str, batch_size: int):
 
 def cluster_words(
         embedding_matrix: np.ndarray,
-        target_cluster_size: int = 50,
+        target_cluster_size: int = 100,
         neighbor_alg: str = NEIGHBOR_ALG,
 ):
     """
@@ -844,16 +844,44 @@ def compute_textual_factors(
 
 
 def _range_to_bounds(rng):
-    """Convert a Python range (or None) to (start, end_exclusive, n_pages)."""
+    """Convert a page spec to (pages_from, pages_to, n_pages).
+
+    Supports:
+      - range
+      - list/tuple/set/np.ndarray of ints
+      - None
+
+    Note:
+      We report pages_to as the *inclusive* max page number (matching your page-range notation),
+      and n_pages as the number of unique pages.
+    """
     if rng is None:
         return None, None, None
+
+    # Fast path: Python range
+    if isinstance(rng, range):
+        if len(rng) == 0:
+            return None, None, 0
+        pages_from = int(rng.start)
+        pages_to = int(rng.stop)  # inclusive last page
+        n_pages = len(rng)
+        return pages_from, pages_to, n_pages
+
+    # Iterable of explicit page integers (e.g., list(chain(...)))
     try:
-        start = int(rng.start)
-        stop = int(rng.stop)
-        n_pages = max(0, stop - start)
-        return start, stop, n_pages
+        pages = [int(x) for x in rng]
     except Exception:
         return None, None, None
+
+    if not pages:
+        return None, None, 0
+
+    # De-duplicate + sort for stable bounds
+    uniq = sorted(set(pages))
+    pages_from = int(uniq[0])
+    pages_to = int(uniq[-1])
+    n_pages = int(len(uniq))
+    return pages_from, pages_to, n_pages
 
 def _parse_bank_year_from_filename(fname: str):
     """Parse (bank, year) from expected PDF filenames."""
@@ -875,7 +903,13 @@ def build_extraction_summary(
     page_ranges_year: dict,
     year_label: str,
 ) -> pd.DataFrame:
-    """Create a bank-year extraction QC table."""
+    """Create a bank-year extraction QC table.
+
+    Each row includes:
+      - pages_from: first page number (inclusive)
+      - pages_to: last page number (inclusive)
+      - n_pages: number of unique pages extracted
+    """
 
     # Token counts: raw -> filtered
     tok_before_series = df_docs_before_filter.set_index("file").get("tokens_raw")
