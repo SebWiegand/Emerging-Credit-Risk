@@ -44,12 +44,12 @@ EMBEDDING_BATCH_SIZE = 200
 N_BITS = 256
 N_TABLES = 32
 NEIGHBOR_ALG = "lsh"               # "lsh" or "brute"
-TARGET_CLUSTER_SIZE = 100           # target / soft cap for words per cluster
+TARGET_CLUSTER_SIZE = 80           # target / soft cap for words per cluster
 
 # --- Textual Factors / SVD ---
 N_TOPICS_PER_CLUSTER = 1           # 1 or 2
 # Drop clusters whose first singular value is below this threshold (0 = keep all)
-MIN_SINGULAR_VALUE = 50
+MIN_SINGULAR_VALUE = 0
 
 # --- Optional outputs ---
 MERGE_ALL_TF_LOADINGS_IN_EXTRACTION_SUMMARY = True  # makes extraction_summary very wide
@@ -863,7 +863,7 @@ def _range_to_bounds(rng):
         if len(rng) == 0:
             return None, None, 0
         pages_from = int(rng.start)
-        pages_to = int(rng.stop)  # inclusive last page
+        pages_to = int(rng.stop) - 1  # inclusive last page (range stop is exclusive)
         n_pages = len(rng)
         return pages_from, pages_to, n_pages
 
@@ -1044,69 +1044,52 @@ def main():
     if MIN_SINGULAR_VALUE > 0:
         sv_df = tf_results["singular_values_df"].copy()
 
-        # Column names differ across helper versions; support both.
-        # Current expected columns (from your output CSV): cluster, leading_singular, second_singular
-        sv_cluster_col = "cluster" if "cluster" in sv_df.columns else ("cluster_id" if "cluster_id" in sv_df.columns else None)
-        sv_value_col = (
-            "leading_singular" if "leading_singular" in sv_df.columns
-            else ("singular_value" if "singular_value" in sv_df.columns
-                  else ("singular_values" if "singular_values" in sv_df.columns else None))
-        )
-
-        if sv_cluster_col is None or sv_value_col is None:
-            raise KeyError(
-                f"singular_values_df missing expected columns. "
-                f"Found columns: {list(sv_df.columns)}"
-            )
-
-        # Keep only clusters meeting threshold (use leading singular value)
         keep_clusters = sv_df.loc[
-            sv_df[sv_value_col] >= MIN_SINGULAR_VALUE,
-            sv_cluster_col
+            sv_df["leading_singular"] >= MIN_SINGULAR_VALUE,
+            "cluster"
         ].astype(int).tolist()
 
-        total_clusters = int(sv_df[sv_cluster_col].nunique())
-        print(f"Dropping clusters with {sv_value_col} < {MIN_SINGULAR_VALUE}")
-        print(f"Keeping {len(keep_clusters)} out of {total_clusters} clusters")
+        tf_results["first_doc_topics_df"] = tf_results["first_doc_topics_df"].query(
+            "cluster_id in @keep_clusters").copy()
 
-        # Filter document-level loadings (these frames use 'cluster_id')
-        if "cluster_id" in tf_results["first_doc_topics_df"].columns:
-            tf_results["first_doc_topics_df"] = tf_results["first_doc_topics_df"][
-                tf_results["first_doc_topics_df"]["cluster_id"].isin(keep_clusters)
-            ].copy()
+        if not tf_results["second_doc_topics_df"].empty:
+            tf_results["second_doc_topics_df"] = tf_results["second_doc_topics_df"].query(
+                "cluster_id in @keep_clusters").copy()
 
-        if not tf_results["second_doc_topics_df"].empty and "cluster_id" in tf_results["second_doc_topics_df"].columns:
-            tf_results["second_doc_topics_df"] = tf_results["second_doc_topics_df"][
-                tf_results["second_doc_topics_df"]["cluster_id"].isin(keep_clusters)
-            ].copy()
+        tf_results["topics_words_df"] = tf_results["topics_words_df"].query("cluster_id in @keep_clusters").copy()
 
-        # Filter word-level loadings
-        if "cluster_id" in tf_results["topics_words_df"].columns:
-            tf_results["topics_words_df"] = tf_results["topics_words_df"][
-                tf_results["topics_words_df"]["cluster_id"].isin(keep_clusters)
-            ].copy()
+        if not tf_results["topics_words2_df"].empty:
+            tf_results["topics_words2_df"] = tf_results["topics_words2_df"].query("cluster_id in @keep_clusters").copy()
 
-        if "topics_words2_df" in tf_results and not tf_results["topics_words2_df"].empty and "cluster_id" in tf_results["topics_words2_df"].columns:
-            tf_results["topics_words2_df"] = tf_results["topics_words2_df"][
-                tf_results["topics_words2_df"]["cluster_id"].isin(keep_clusters)
-            ].copy()
-
-        # Filter singular values and importances
-        tf_results["singular_values_df"] = sv_df[
-            sv_df[sv_cluster_col].isin(keep_clusters)
-        ].copy()
-
-        if "cluster_id" in tf_results["topic_importances_df"].columns:
-            tf_results["topic_importances_df"] = tf_results["topic_importances_df"][
-                tf_results["topic_importances_df"]["cluster_id"].isin(keep_clusters)
-            ].copy()
-        elif "cluster" in tf_results["topic_importances_df"].columns:
-            tf_results["topic_importances_df"] = tf_results["topic_importances_df"][
-                tf_results["topic_importances_df"]["cluster"].isin(keep_clusters)
-            ].copy()
+        tf_results["singular_values_df"] = sv_df.query("cluster in @keep_clusters").copy()
+        tf_results["topic_importances_df"] = tf_results["topic_importances_df"].query(
+            "cluster_id in @keep_clusters").copy()
 
     if N_TOPICS_PER_CLUSTER < 2:
         print("\nNote: N_TOPICS_PER_CLUSTER=1, so TF2 outputs are skipped.")
+
+    # ------------------------------------------------------------
+    # Merge ALL TF topic-loadings into extraction summary (wide)
+    # ------------------------------------------------------------
+    if MERGE_ALL_TF_LOADINGS_IN_EXTRACTION_SUMMARY:
+        all_loadings = tf_results["first_doc_topics_df"].copy()
+
+        # Attach file names (document -> file)
+        all_loadings = all_loadings.merge(df_docs[["document", "file"]], on="document", how="left")
+
+        # Keep 1 row per file with all topic_loading_* columns
+        tf_cols = [c for c in all_loadings.columns if c.startswith("topic_loading_")]
+        all_loadings = all_loadings[["file"] + tf_cols].drop_duplicates("file")
+
+        # Merge into extraction summary
+        extraction_summary = extraction_summary.merge(all_loadings, on="file", how="left")
+
+        # Overwrite SAME CSV (so you only have one document)
+        extraction_summary.to_csv(summary_path, index=False)
+
+        print("Merged TF loadings into extraction_summary and overwrote extraction_summary_ALL_V1.csv ✓")
+        print("TF columns added:", len(tf_cols))
+
 
     print("\n=== Saving results ===")
     tf_results["first_doc_topics_df"].to_csv(os.path.join(out_folder, "first_doc_topics.csv"), index=False)
@@ -1114,6 +1097,7 @@ def main():
     # Only write TF2 if it exists (n_topics_per_cluster >= 2)
     if not tf_results["second_doc_topics_df"].empty:
         tf_results["second_doc_topics_df"].to_csv(os.path.join(out_folder, "second_doc_topics.csv"), index=False)
+
 
     tf_results["topics_words_df"].to_csv(os.path.join(out_folder, "topics_words.csv"), index=False)
     tf_results["singular_values_df"].to_csv(os.path.join(out_folder, "singular_values.csv"), index=False)
