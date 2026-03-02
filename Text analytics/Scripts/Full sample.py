@@ -47,7 +47,7 @@ NEIGHBOR_ALG = "lsh"               # "lsh" or "brute"
 TARGET_CLUSTER_SIZE = 50           # target / soft cap for words per cluster
 
 # --- Textual Factors / SVD ---
-N_TOPICS_PER_CLUSTER = 2           # 1 or 2
+N_TOPICS_PER_CLUSTER = 1           # 1 or 2
 # Drop clusters whose first singular value is below this threshold (0 = keep all)
 MIN_SINGULAR_VALUE = 50
 
@@ -132,7 +132,6 @@ page_ranges = {
     "bankinter_2024.pdf": list(chain(range(67, 85))),
 
     # --- Banco Bilbao (BBVA) ---
-    # Some files use a NYSE_ prefix; include both exact-name variants
     "NYSE_BBVA_2015.pdf": list(chain(range(75, 109))),
     "NYSE_BBVA_2016.pdf": list(chain(range(34, 72), range(310, 319))),
     "NYSE_BBVA_2017.pdf": list(chain(range(37, 40), range(102, 109))),
@@ -171,7 +170,6 @@ page_ranges = {
     "santander_2024.pdf": list(chain(range(501, 561), range(787, 823))),
 
     # --- ING ---
-    # Folder uses NYSE_IDG_YYYY.pdf; some runs may also use IDG_YYYY.pdf
     "NYSE_IDG_2015.pdf": list(chain(range(54, 60), range(264, 333), range(358, 379))),
     "NYSE_IDG_2016.pdf": list(chain(range(56, 64), range(249, 319), range(349, 369))),
     "NYSE_IDG_2017.pdf": list(chain(range(42, 51), range(223, 289), range(316, 337))),
@@ -185,7 +183,6 @@ page_ranges = {
 
 
     # --- Barclays ---
-    # Folder uses LSE_BARC_YYYY.pdf; some runs may also use barclays_YYYY.pdf
     "LSE_BARC_2015.pdf": list(chain(range(120, 216))),
     "LSE_BARC_2016.pdf": list(chain(range(12, 14), range(133, 236))),
     "LSE_BARC_2017.pdf": list(chain(range(12, 14), range(116, 196))),
@@ -293,7 +290,6 @@ page_ranges = {
     "nykredit_2022.pdf": list(chain(range(0, 69))),
     "nykredit_2023.pdf": list(chain(range(0, 71))),
     "nykredit_2024.pdf": list(chain(range(0, 56))),
-
 
     # --- Banco BPM ---
     "BPM_2015.pdf": list(chain(range(105, 107), range(283, 358))),
