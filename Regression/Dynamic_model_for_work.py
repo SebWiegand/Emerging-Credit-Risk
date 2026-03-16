@@ -212,10 +212,10 @@ controls_firm_year = (
     .mean()
     .rename(columns={"company":"firm_id"})
 )
+
 # ============================
 # Step 2: Prepare firm-year TFs
 # ============================
-
 # Collapse to one row per firm-year
 tf_firm_year = tf.groupby(["bank", "year"], as_index=False)[topic_cols].mean()
 
