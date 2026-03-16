@@ -1,27 +1,35 @@
-import os
-import sys
-import re
-import nltk
-from itertools import chain
-import fitz  # PyMuPDF
-import numpy as np
-import pandas as pd
-from collections import Counter
+# ===========================================================
+# Importing packages
+# ===========================================================
 
-from openai import OpenAI
+import os                  # paths, env vars, output folders
+import sys                 # add Cong/Text analytics dirs to sys.path
+import re                  # filename parsing
+import nltk                # nltk.data.path
+from itertools import chain  # page_ranges construction
+import fitz                # PDF reading
+import numpy as np         # arrays, document ids
+import pandas as pd        # DataFrames
+from collections import Counter  # token counts, df counts, bigrams
+from openai import OpenAI  # embeddings client
+import builtins
+import contextlib
+import io
+from tqdm import tqdm      # progress bars
 
 # ===========================================================
-# 0. GLOBAL SETTINGS (edit here)
+# GLOBAL SETTINGS
+# All tunable pipeline settings are defined here.
 # ===========================================================
 
 # --- Run / IO ---
 STRICT_PAGE_RANGES = True          # If True, require every PDF to be present in page_ranges
-RUN_LABEL = "ALL"                  # written into extraction_summary
+RUN_LABEL = "2015-2020"                  # use "ALL", "2015-2020", or "2015,2016,2017" to restrict the sample years
 MIN_DOC_TOKENS = 5                 # drop documents with fewer tokens than this after filtering
 
 # --- Text preprocessing ---
 TOKEN_MIN_LEN = 3                  # drop tokens shorter than this
-MIN_DF = 10                         # token must appear in at least MIN_DF documents
+MIN_DF = 10                        # token must appear in at least MIN_DF documents
 EXTRA_DROP_WORDS = {
     # Generic report boilerplate
     "annual", "report", "reports", "group", "plc", "page", "pages", "section", "chapter",
@@ -41,19 +49,33 @@ EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_BATCH_SIZE = 200
 
 # --- Clustering (LSH / neighbors) ---
-N_BITS = 256
-N_TABLES = 32
+N_BITS = 256                       # Computed in tune.lsh.py
+N_TABLES = 32                      # Computed in tune.lsh.py
 NEIGHBOR_ALG = "lsh"               # "lsh" or "brute"
 TARGET_CLUSTER_SIZE = 80           # target / soft cap for words per cluster
+NEIGHBOR_RANDOM_STATE = 42         # random seed for NeighborFinder
+NEIGHBOR_NUM_QUERIES = 1000        # number of diagnostic queries used by NeighborFinder
 
 # --- Textual Factors / SVD ---
 N_TOPICS_PER_CLUSTER = 1           # 1 or 2
 # Drop clusters whose first singular value is below this threshold (0 = keep all)
 MIN_SINGULAR_VALUE = 0
 
+# --- Bigrams ---
+USE_BIGRAMS = True
+BIGRAM_MIN_COUNT = 100   # bigram must appear at least this many times in the corpus
+
 # --- Optional outputs ---
 MERGE_ALL_TF_LOADINGS_IN_EXTRACTION_SUMMARY = True  # makes extraction_summary very wide
 
+# ===========================================================
+# RUNTIME CACHE / INTERNAL STATE
+# ===========================================================
+_BIGRAM_SET_CACHE: set[tuple[str, str]] | None = None  # Cache of learned corpus bigrams so they are computed only once even if preprocessing runs multiple times
+
+# ===========================================================
+# OPENAI CLIENT SETUP
+# ===========================================================
 # Read API key from environment variable (set in PyCharm Run Configuration)
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if OPENAI_API_KEY is None:
@@ -61,11 +83,10 @@ if OPENAI_API_KEY is None:
         "Missing OPENAI_API_KEY environment variable. "
         "Set it in Run → Edit Configurations → Environment variables."
     )
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ------------------------------------------------------------
-# Directions
+# Local paths and imports for the Cong et al. replication code
 # ------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../Text analytics/Scripts
 TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
@@ -102,9 +123,6 @@ from TextualFactors import (
 # Reports live in:      <repo>/Text analytics/Reports/
 reports_folder = os.path.join(TEXT_ANALYTICS_DIR, "Bank reports")
 print("Reports folder:", reports_folder)
-
-# Your own page_ranges (copied from your notebook)
-
 
 page_ranges = {
     # --- BDS ---
@@ -419,77 +437,120 @@ page_ranges = {
 # 1. LOAD TEXT FROM PDF´s
 # ============================================================
 
-# Flat-lookup version for loading report paragraphs
-def load_report_paragraphs(reports_folder, page_ranges, strict=True):
-    report_paragraphs = []
-    report_paragraphs_source = []
+# Flat-lookup version for loading report text blocks
+def load_report_text_blocks(reports_folder, page_ranges, strict=True):
+    """
+    Load text blocks from PDFs using predefined page ranges.
+
+    Parameters
+    ----------
+    reports_folder : str
+        Root folder containing the PDF files.
+    page_ranges : dict
+        Mapping from filename to iterable of page numbers to extract.
+    strict : bool, default True
+        If True, raise an error if a PDF is missing from page_ranges
+        or if a file listed in page_ranges is not found.
+
+    Returns
+    -------
+    tuple[list[str], list[str]]
+        Parallel lists of extracted text blocks and their source filenames.
+    """
+    report_text_blocks = []
+    report_text_blocks_source = []
+    target_files = set(page_ranges.keys())
+    found_targets = set()
 
     print(f"Looking for PDFs in: {reports_folder}")
 
-    for path, dirs, files in os.walk(reports_folder):
+    pdf_file_paths = []
+    for path, _, files in os.walk(reports_folder):
         pdfs = [file for file in files if file.lower().endswith(".pdf")]
         if not pdfs:
             continue
-        print("Found PDFs:", pdfs)
-
         for _file in pdfs:
-            print(f"Processing {_file}...")
-            full_path = os.path.join(path, _file)
+            pdf_file_paths.append((path, _file))
 
-            if _file not in page_ranges:
-                if strict:
-                    raise ValueError(
-                        f"File '{_file}' not found in page_ranges. "
-                        "Add it explicitly or rename the file."
-                    )
-                else:
-                    continue
+    for path, _file in tqdm(pdf_file_paths, desc="Reading PDFs"):
+        full_path = os.path.join(path, _file)
 
-            pages_to_process = page_ranges[_file]
+        # Skip PDFs that are not part of the selected run (e.g. filtered by RUN_LABEL)
+        if _file not in page_ranges:
+            continue
 
-            with fitz.open(full_path) as doc:
-                total_pages = len(doc)
+        found_targets.add(_file)
+        pages_to_process = page_ranges[_file]
 
-                if pages_to_process is None:
-                    pages_to_process = range(total_pages)
+        with fitz.open(full_path) as doc:
+            total_pages = len(doc)
 
-                actual_pages = []
-                for page_num in pages_to_process:
-                    if isinstance(page_num, int):
-                        if page_num < 0:
-                            actual_page = total_pages + page_num
-                        else:
-                            actual_page = page_num
+            if pages_to_process is None:
+                pages_to_process = range(total_pages)
 
-                        if 0 <= actual_page < total_pages:
-                            actual_pages.append(actual_page)
+            actual_pages = []
+            for page_num in pages_to_process:
+                if isinstance(page_num, (int, np.integer)):
+                    if page_num < 0:
+                        actual_page = total_pages + page_num
+                    else:
+                        actual_page = page_num
 
-                for page_num in actual_pages:
-                    page = doc[page_num]
-                    blocks = [x[4] for x in page.get_text("blocks")]
-                    blocks = [block.strip() for block in blocks if block.strip()]
+                    if 0 <= actual_page < total_pages:
+                        actual_pages.append(actual_page)
 
-                    if blocks:
-                        report_paragraphs.extend(blocks)
-                        report_paragraphs_source.extend([_file] * len(blocks))
+            for page_num in actual_pages:
+                page = doc[page_num]
+                blocks = [x[4] for x in page.get_text("blocks")]
+                blocks = [block.strip() for block in blocks if block.strip()]
 
-    return report_paragraphs, report_paragraphs_source
+                if blocks:
+                    report_text_blocks.extend(blocks)
+                    report_text_blocks_source.extend([_file] * len(blocks))
+
+    if strict:
+        missing = sorted(target_files - found_targets)
+        if missing:
+            raise ValueError(
+                "The following PDFs were listed in page_ranges but were not found under reports_folder: "
+                f"{missing}. Check the folder path and filenames."
+            )
+
+    return report_text_blocks, report_text_blocks_source
+
 # Output:
 # After this section we have two parallel lists:
-# 1) report_paragraphs        -> all extracted text paragraphs (strings)
-# 2) report_paragraphs_source -> which PDF each paragraph came from
-# Both lists have the same length; each index represents one paragraph.
+# 1) report_text_blocks        -> extracted text blocks from the PDFs (strings)
+# 2) report_text_blocks_source -> which PDF each block came from
+# Both lists have the same length; each index represents one text block.
+
 # ============================================================
 # 2. BUILD DOCUMENT DATAFRAME
 # ============================================================
 # Short summary:
-# - Combine paragraph-level text into one document per PDF (bank × year).
+# - Combine text blocks into one document per PDF (bank × year).
 # - Parse bank and year from filenames (expects bank_YYYY.pdf; fallback YYYY_bank_group.pdf).
 # - Validate that bank/year parsing succeeds (fail fast if not).
 # - Assign a stable integer document ID for downstream analysis.
 
-def build_document_dataframe(report_paragraphs, report_sources):
-    df = pd.DataFrame({"file": report_sources, "content": report_paragraphs})
+def build_document_dataframe(report_text_blocks, report_sources):
+    """
+    Combine extracted text blocks into one document per PDF.
+
+    Parameters
+    ----------
+    report_text_blocks : list[str]
+        Extracted text blocks from the PDF corpus.
+    report_sources : list[str]
+        Parallel list of source PDF filenames.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per PDF with columns for file, content, bank, year, and document ID.
+    """
+
+    df = pd.DataFrame({"file": report_sources, "content": report_text_blocks})
 
     df_grouped = df.groupby("file", as_index=False).agg({"content": lambda texts: "\n".join(texts)})
     if df_grouped.empty:
@@ -523,19 +584,28 @@ def build_document_dataframe(report_paragraphs, report_sources):
 # Output:
 # - DataFrame with one row per PDF containing:
 #   * document : integer document ID (0, 1, 2, ...)
-#   * content  : full text of the PDF (all paragraphs joined)
+#   * content  : full text of the PDF (all text blocks joined)
 #   * file     : source PDF filename
 #   * bank     : bank identifier parsed from filename (lowercased)
 #   * year     : year parsed from filename
 
 # ============================================================
-# 3. TEXT PREPROCESSING (engine.py) + TOKEN FILTERING
+# 3. TEXT PREPROCESSING
 # ============================================================
-# Short summary:
-# - Clean and normalize the raw text in `content` (whitespace, encoding, formatting).
+# Purpose:
+# - Clean and normalize raw text.
 # - Tokenize text and compute per-document word counts.
-# - Remove obvious junk tokens (short tokens, non-letters, boilerplate/bank identifiers).
-# - Remove rare tokens across the corpus using a minimum document-frequency threshold.
+# - Remove obvious junk tokens.
+# - Optionally learn and append frequent bigrams.
+# - Apply corpus-level document-frequency filtering.
+# - Rebuild final word counts from the filtered token list.
+
+
+# ------------------------------------------------------------
+# 3A. TOKEN-LEVEL CLEANUP HELPERS
+# ------------------------------------------------------------
+# These helpers work on token lists after tokenization.
+# They remove obvious junk and apply corpus-level token filtering.
 
 def _basic_token_filter(tokens: list[str]) -> list[str]:
     """Remove obvious junk tokens before df-based filtering."""
@@ -548,14 +618,13 @@ def _basic_token_filter(tokens: list[str]) -> list[str]:
             continue
         if len(t) < TOKEN_MIN_LEN:
             continue
-        # keep only alphabetic tokens -> removes '_' and mixed punctuation/nums
-        if not t.isalpha():
+        # keep alphabetic tokens OR underscore-joined alphabetic bigrams (e.g. "interest_rate")
+        if not all(part.isalpha() for part in t.split("_")):
             continue
         if t in EXTRA_DROP_WORDS:
             continue
         out.append(t)
     return out
-
 
 def _df_filter_tokens(df: pd.DataFrame, tokens_col: str, min_df: int) -> pd.DataFrame:
     """Apply document-frequency filtering (min_df only) across the corpus."""
@@ -566,10 +635,56 @@ def _df_filter_tokens(df: pd.DataFrame, tokens_col: str, min_df: int) -> pd.Data
         df_counter.update(set(toks))
 
     allowed = {tok for tok, dfi in df_counter.items() if dfi >= min_df}
-
     df[tokens_col] = df[tokens_col].apply(lambda toks: [t for t in toks if t in allowed])
     return df
 
+
+def _rebuild_word_freq_from_tokens(df: pd.DataFrame, tokens_col: str = "tokens") -> pd.DataFrame:
+    """Rebuild word_freq after token filtering / bigram augmentation."""
+    df = df.copy()
+    df["word_freq"] = df[tokens_col].apply(
+        lambda toks: Counter(toks) if isinstance(toks, list) else Counter()
+    )
+    return df
+
+# ------------------------------------------------------------
+# 3B. BIGRAM HELPERS
+# ------------------------------------------------------------
+# These helpers learn frequent adjacent token pairs and append them
+# as underscore-joined bigram tokens while keeping the original unigrams.
+
+def _learn_frequent_bigrams(docs_tokens: list[list[str]], min_count: int) -> set[tuple[str, str]]:
+    """Learn frequent bigrams from the corpus using a simple count threshold."""
+    bigram_counts = Counter()
+    for toks in docs_tokens:
+        if not toks or len(toks) < 2:
+            continue
+        for a, b in zip(toks, toks[1:]):
+            # ignore tokens that are already phrases or malformed
+            if ("_" in a) or ("_" in b):
+                continue
+            bigram_counts[(a, b)] += 1
+
+    return {bg for bg, c in bigram_counts.items() if c >= min_count}
+
+
+def _augment_with_bigrams(tokens: list[str], bigram_set: set[tuple[str, str]]) -> list[str]:
+    """Append learned bigrams as extra tokens while keeping the original unigrams."""
+    if not tokens or len(tokens) < 2 or not bigram_set:
+        return tokens
+
+    augmented = list(tokens)
+    for a, b in zip(tokens, tokens[1:]):
+        if (a, b) in bigram_set:
+            augmented.append(f"{a}_{b}")
+    return augmented
+
+# ------------------------------------------------------------
+# 3C. MAIN PREPROCESSING PIPELINE
+# ------------------------------------------------------------
+# This is the canonical preprocessing function used throughout the script.
+# It is applied both to text blocks (for embedding training) and to
+# document-level text (for textual-factor construction).
 
 def preprocess_text_and_tokens(
     df: pd.DataFrame,
@@ -578,14 +693,34 @@ def preprocess_text_and_tokens(
     min_df: int = MIN_DF,
 ) -> pd.DataFrame:
     """
-    Canonical preprocessing step used everywhere in this pipeline.
+    Run the full preprocessing pipeline on a DataFrame containing raw text.
 
-    1) Clean and normalize raw text (engine.clean_and_normalize_text)
-    2) Tokenize + count word frequencies (engine.calculate_word_frequencies)
-    3) Apply basic token cleanup (length/alpha/stop words)
-    4) Apply document-frequency filtering (min_df only)
+    Steps
+    -----
+    1. Clean and normalize raw text in ``text_col``.
+    2. Tokenize text and compute initial per-document word counts.
+    3. Preserve raw tokens in ``tokens_raw`` for QC.
+    4. Apply token-level cleanup with ``_basic_token_filter``.
+    5. Learn and append frequent bigrams.
+    6. Apply corpus-level document-frequency filtering.
+    7. Rebuild ``word_freq`` from the final filtered token list.
 
-    Returns a new DataFrame with cleaned text, filtered tokens, and word_freq.
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame containing a text column.
+    text_col : str, default "content"
+        Name of the raw-text column.
+    tokens_col : str, default "tokens"
+        Name of the token column to create/update.
+    min_df : int, default MIN_DF
+        Minimum document frequency required for a token to be kept.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of the input DataFrame with cleaned text, filtered tokens,
+        raw tokens for QC, and rebuilt word counts.
     """
 
     df = df.copy()
@@ -600,40 +735,73 @@ def preprocess_text_and_tokens(
     if "tokens_raw" not in df.columns:
         df["tokens_raw"] = df[tokens_col].apply(lambda x: list(x) if isinstance(x, list) else [])
 
-    # 3) Per-document token cleanup
+    # 3) Per-document token cleanup (unigrams)
     df[tokens_col] = df[tokens_col].apply(_basic_token_filter)
 
-    # 4) DF-based filtering across corpus
+    # 3b) OPTIONAL: learn + insert frequent bigrams (keep unigrams too)
+    # NOTE: We cache the learned bigrams so the message only prints once even if
+    # preprocess_text_and_tokens() is called multiple times in a single run.
+    if USE_BIGRAMS:
+        global _BIGRAM_SET_CACHE
+        if _BIGRAM_SET_CACHE is None:
+            _BIGRAM_SET_CACHE = _learn_frequent_bigrams(df[tokens_col].tolist(), min_count=BIGRAM_MIN_COUNT)
+            print(f"Learned {len(_BIGRAM_SET_CACHE)} bigrams with count >= {BIGRAM_MIN_COUNT}")
+        df[tokens_col] = df[tokens_col].apply(lambda toks: _augment_with_bigrams(toks, _BIGRAM_SET_CACHE))
+
+    # 4) DF-based filtering across corpus (applies to both unigrams and bigrams)
     df = _df_filter_tokens(df, tokens_col=tokens_col, min_df=min_df)
+
+    # IMPORTANT: rebuild word_freq so later tables use counts from the final token list
+    df = _rebuild_word_freq_from_tokens(df, tokens_col=tokens_col)
 
     return df
 
 # Output:
-# - Returns the same DataFrame with additional / updated columns:
-#   * content   : cleaned & normalized text
-#   * tokens    : filtered list of tokens per document
-#   * word_freq : Counter/dict of word -> count per document
-#   * tokens_raw: unfiltered tokens directly from tokenization
+# - Returns the same DataFrame with these key columns:
+#   * content    : cleaned and normalized text
+#   * tokens     : final filtered token list
+#   * tokens_raw : raw tokens saved before filtering (for QC)
+#   * word_freq  : Counter of token counts rebuilt from the final token list
 
-# Note: We only use a subset of functions from engine.py.
-# The unused utilities (daily aggregation, long-format by date) are meant for true time-series text data,
-# but our documents are grouped by bank-year, not by calendar dates, so these functions are not needed here.
+# Note:
+# - We only use a subset of helper functions from engine.py.
+# - The unused utilities in engine.py are intended for dated time-series text,
+#   whereas this project works with bank-year documents rather than daily text.
 
 # ============================================================
 # 4. OPENAI EMBEDDING FUNCTION
 # ============================================================
+"""
+Build word embeddings using OpenAI's embedding API.
+
+Inputs
+------
+df : DataFrame
+    DataFrame containing tokenized text blocks.
+model_name : str
+    OpenAI embedding model name.
+batch_size : int
+    Number of tokens embedded per API request.
+
+Outputs
+-------
+vocab : list[str]
+    Vocabulary used for embeddings.
+embedding_matrix : np.ndarray
+    Matrix of shape (vocab_size × embedding_dim).
+"""
 
 def train_openai_embeddings(df, model_name: str, batch_size: int):
     """
     Build word embeddings using OpenAI's embedding API.
-    Trains on paragraph-level tokens.
+    Trains on text-block-level tokens.
     """
     vocab = sorted(set(chain.from_iterable(df["tokens"].tolist())))
     print(f"Vocabulary size: {len(vocab)} words")
 
     embeddings = []
 
-    for i in range(0, len(vocab), batch_size):
+    for i in tqdm(range(0, len(vocab), batch_size), desc="Embedding batches"):
         batch = vocab[i:i+batch_size]
         response = client.embeddings.create(
             model=model_name,
@@ -649,7 +817,6 @@ def train_openai_embeddings(df, model_name: str, batch_size: int):
 
         batch_embs = [item.embedding for item in response.data]
         embeddings.extend(batch_embs)
-        print(f"Processed batch {i//batch_size + 1}")
 
     # --- FINAL SAFETY CHECK ---
     if len(embeddings) != len(vocab):
@@ -671,11 +838,10 @@ def train_openai_embeddings(df, model_name: str, batch_size: int):
 # ============================================================
 # 5. WORD-CLUSTERING (NeighborFinder + EmbeddingCluster)
 # ============================================================
-
 def cluster_words(
         embedding_matrix: np.ndarray,
-        target_cluster_size: int = 100,
-        neighbor_alg: str = NEIGHBOR_ALG,
+        target_cluster_size: int,
+        neighbor_alg: str,
 ):
     """
     Cluster word embeddings into semantic groups.
@@ -688,9 +854,9 @@ def cluster_words(
     4) Run sequential clustering to group similar words.
 
     Inputs:
-    - embedding_matrix : numpy array (V x D) from Word2Vec
-    - target_cluster_size : target / soft cap for words per cluster (clusters may end up smaller)
-    - neighbor_alg     : "lsh" (fast, uses FAISS LSH) or "brute" (exact)
+    - embedding_matrix : numpy array (V x D) of word embeddings (from OpenAI embedding model)
+    - target_cluster_size : target / soft cap for words per cluster, supplied from the global settings block
+    - neighbor_alg     : "lsh" or "brute", supplied from the global settings block
 
     Outputs:
     - ec                : EmbeddingCluster object
@@ -705,8 +871,8 @@ def cluster_words(
     # 1) Build neighbor search engine (brute-force index always built inside)
     nf = NeighborFinder(
         embedding_matrix,
-        random_state=42,
-        num_queries=1000,   # used for their internal diagnostics if needed
+        random_state=NEIGHBOR_RANDOM_STATE,
+        num_queries=NEIGHBOR_NUM_QUERIES,
     )
 
     # 2) If we use LSH, create the FAISS LSH index with tuned parameters
@@ -720,7 +886,15 @@ def cluster_words(
     ec = EmbeddingCluster(nf, neighbor_alg=neighbor_alg)
 
     # 4) Perform clustering (Cong et al.'s sequential clustering)
-    clusters = ec.sequentialcluster(cluster_size=target_cluster_size)
+    # Suppress extremely verbose cluster-by-cluster prints from the library
+    _original_print = builtins.print
+    try:
+        builtins.print = lambda *args, **kwargs: None
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            clusters = ec.sequentialcluster(cluster_size=target_cluster_size)
+    finally:
+        builtins.print = _original_print
+
 
     # Map clusters <-> words
     cluster_words_map, word_cluster_map = ec.cluster_word_map(clusters)
@@ -776,72 +950,84 @@ def build_word_cluster_data(vocab: list[str], word_cluster_map: dict) -> pd.Data
 def compute_textual_factors(
     document_word_data: pd.DataFrame,
     word_cluster_data: pd.DataFrame,
-    n_topics: int = 1
 ) -> dict:
     """
-    Runs SVD/LSA inside each word cluster using TextualFactors.lsa_topics().
+    Run one-topic SVD/LSA inside each word cluster using TextualFactors.lsa_topics().
 
-    Returns:
-      - first_doc_topics_df
-      - second_doc_topics_df (empty if n_topics < 2)
-      - topics_words_df (TF1 word loadings)
-      - topics_words2_df (TF2 word loadings; empty if n_topics < 2)
-      - singular_values_df
-      - topic_importances_df
+    Returns
+    -------
+    dict
+        Dictionary containing document-level topic loadings, word-level topic
+        loadings, singular values, and topic importance weights for the first
+        topic in each cluster.
     """
     tf_model = TextualFactors(
         document_word_data=document_word_data,
         word_cluster_data=word_cluster_data
     )
-    (
-        first_doc_topics,
-        second_doc_topics,
-        first_topics_words,
-        second_topics_words,
-        singular_values,
-        topic_importances,
-    ) = tf_model.lsa_topics(
-        cluster_type="sequential_cluster",
-        n_topics=n_topics
-    )
+
+    # Suppress tqdm/progress-bar noise and the extremely verbose per-cluster print lines.
+    _original_print = builtins.print
+
+    def _filtered_print(*args, **kwargs):
+        text = " ".join(str(arg) for arg in args)
+        if "the cluster " in text and " has been processed" in text:
+            return
+        return _original_print(*args, **kwargs)
+
+    try:
+        builtins.print = _filtered_print
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            (
+                first_doc_topics,
+                _second_doc_topics,
+                first_topics_words,
+                _second_topics_words,
+                singular_values,
+                topic_importances,
+            ) = tf_model.lsa_topics(
+                cluster_type="sequential_cluster",
+                n_topics=1
+            )
+    finally:
+        builtins.print = _original_print
 
     first_doc_topics_df = transfer_document_topics(first_doc_topics)
-
-    if n_topics < 2:
-        second_doc_topics_df = pd.DataFrame(columns=["cluster_id", "document", "topic_loading"])
-        topics_words2_df = pd.DataFrame(columns=["topic", "word", "topic_loading"])
-    else:
-        second_doc_topics_df = transfer_document_topics(second_doc_topics)
-        topics_words2_df = transfer_topic_words(second_topics_words)
-
     topics_words_df = transfer_topic_words(first_topics_words)
-
     singular_values_df = transfer_sigular_values(singular_values)
     topic_importances_df = transfer_topic_importances(topic_importances)
 
     return {
         "first_doc_topics_df": first_doc_topics_df,
-        "second_doc_topics_df": second_doc_topics_df,
         "topics_words_df": topics_words_df,
-        "topics_words2_df": topics_words2_df,
         "singular_values_df": singular_values_df,
         "topic_importances_df": topic_importances_df,
     }
 
 # Output:
 # A dictionary of DataFrames containing:
-# - document-level factor loadings (for first and second topic)
-# - word-level topic loadings
+# - document-level factor loadings for the first topic in each cluster
+# - word-level topic loadings for the first topic in each cluster
 # - singular values from SVD
 # - topic importance weights
 
-# ============================================================
-# QC HELPERS (extraction summary)
-# ============================================================
-# Relevance:
-# - Yes. These helpers produce a lightweight QC table so we can verify that
-#   page ranges, extraction, and token filtering behave as expected.
 
+
+# ============================================================
+# 8. QC, PIPELINE POST-PROCESSING, AND MAIN RUNNER
+# ============================================================
+# Purpose:
+# - Build a lightweight extraction QC table.
+# - Apply optional post-processing to textual-factor outputs.
+# - Merge topic loadings into the extraction summary when requested.
+# - Save final pipeline outputs.
+# - Run the full pipeline from raw PDFs to saved CSV outputs.
+
+
+
+# ------------------------------------------------------------
+# 8A. EXTRACTION-SUMMARY HELPERS
+# ------------------------------------------------------------
 
 def _range_to_bounds(rng):
     """Convert a page spec to (pages_from, pages_to, n_pages).
@@ -897,18 +1083,75 @@ def _parse_bank_year_from_filename(fname: str):
 
     return None, None
 
+
+def _parse_years_from_run_label(run_label: str) -> set[int] | None:
+    """
+    Parse the run label into a set of allowed years.
+
+    Supported formats
+    -----------------
+    - "ALL" -> no filtering
+    - "2015-2020" -> inclusive year range
+    - "2015,2016,2017" -> explicit year list
+
+    Returns
+    -------
+    set[int] | None
+        Set of allowed years, or None if no year filtering should be applied.
+    """
+    label = str(run_label).strip()
+    if not label or label.upper() == "ALL":
+        return None
+
+    range_match = re.fullmatch(r"(\d{4})\s*-\s*(\d{4})", label)
+    if range_match:
+        start_year = int(range_match.group(1))
+        end_year = int(range_match.group(2))
+        if end_year < start_year:
+            raise ValueError(f"Invalid RUN_LABEL year range: {run_label}")
+        return set(range(start_year, end_year + 1))
+
+    if "," in label:
+        parts = [p.strip() for p in label.split(",") if p.strip()]
+        if not parts:
+            raise ValueError(f"Invalid RUN_LABEL year list: {run_label}")
+        years = set()
+        for part in parts:
+            if not re.fullmatch(r"\d{4}", part):
+                raise ValueError(f"Invalid year '{part}' in RUN_LABEL: {run_label}")
+            years.add(int(part))
+        return years
+
+    if re.fullmatch(r"\d{4}", label):
+        return {int(label)}
+
+    return None
+
 def build_extraction_summary(
     df_docs_before_filter: pd.DataFrame,
     df_docs_after_filter: pd.DataFrame,
     page_ranges_year: dict,
     year_label: str,
 ) -> pd.DataFrame:
-    """Create a bank-year extraction QC table.
+    """
+    Create a bank-year extraction QC table.
 
-    Each row includes:
-      - pages_from: first page number (inclusive)
-      - pages_to: last page number (inclusive)
-      - n_pages: number of unique pages extracted
+    Parameters
+    ----------
+    df_docs_before_filter : pd.DataFrame
+        Document-level DataFrame before the minimum-document-length filter.
+    df_docs_after_filter : pd.DataFrame
+        Document-level DataFrame after the minimum-document-length filter.
+    page_ranges_year : dict
+        Mapping from filename to page ranges used for extraction.
+    year_label : str
+        Run label written into the QC output.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per PDF with page-range metadata, text-block counts,
+        token counts before/after filtering, and an extraction status flag.
     """
 
     # Token counts: raw -> filtered
@@ -924,12 +1167,12 @@ def build_extraction_summary(
         else {}
     )
 
-    # Approximate paragraph count per file using joined content (newline-separated blocks)
+    # Approximate text-block count per file using joined content (newline-separated blocks)
     # This avoids needing the raw paragraph list at this stage.
-    para_counts = {}
+    block_counts = {}
     if "content" in df_docs_before_filter.columns and "file" in df_docs_before_filter.columns:
         tmp = df_docs_before_filter.set_index("file")["content"].fillna("")
-        para_counts = (tmp.str.count("\n") + 1).to_dict()
+        block_counts = (tmp.str.count("\n") + 1).to_dict()
 
     rows = []
     for fname, rng in page_ranges_year.items():
@@ -947,7 +1190,7 @@ def build_extraction_summary(
             "pages_from": p_from,
             "pages_to": p_to,
             "n_pages": n_pages,
-            "n_paragraphs": int(para_counts.get(fname, 0)),
+            "n_text_blocks": int(block_counts.get(fname, 0)),
             "n_tokens_before": int(tok_before.get(fname, 0)),
             "n_tokens_after": n_tok_after,
             "status": status,
@@ -962,37 +1205,135 @@ def build_extraction_summary(
 
     return summary
 
-def main():
-    print("\n=== STEP 1: Load paragraphs from PDFs ===")
-    page_ranges_year = page_ranges
-    print("Running analysis on FULL corpus (all years)")
+# Output:
+# - One row per PDF with these QC columns:
+#   * year, run_label, file, company
+#   * pages_from, pages_to, n_pages
+#   * n_text_blocks
+#   * n_tokens_before, n_tokens_after
+#   * status
+
+# ------------------------------------------------------------
+# 8B. PIPELINE POST-PROCESSING HELPERS
+# ------------------------------------------------------------
+
+def apply_singular_value_filter(tf_results: dict, min_singular_value: float) -> dict:
+    """
+    Optionally drop clusters whose leading singular value is below the threshold.
+
+    Returns the same tf_results dictionary shape, filtered in place on copies.
+    """
+    if min_singular_value <= 0:
+        return tf_results
+
+    tf_results = {k: v.copy() if hasattr(v, "copy") else v for k, v in tf_results.items()}
+    sv_df = tf_results["singular_values_df"].copy()
+
+    keep_clusters = sv_df.loc[
+        sv_df["leading_singular"] >= min_singular_value,
+        "cluster"
+    ].astype(int).tolist()
+
+    tf_results["first_doc_topics_df"] = tf_results["first_doc_topics_df"].query(
+        "cluster_id in @keep_clusters"
+    ).copy()
+    tf_results["topics_words_df"] = tf_results["topics_words_df"].query(
+        "cluster_id in @keep_clusters"
+    ).copy()
+    tf_results["singular_values_df"] = sv_df.query("cluster in @keep_clusters").copy()
+    tf_results["topic_importances_df"] = tf_results["topic_importances_df"].query(
+        "cluster_id in @keep_clusters"
+    ).copy()
+
+    return tf_results
+
+
+def merge_tf_loadings_into_extraction_summary(
+    extraction_summary: pd.DataFrame,
+    tf_results: dict,
+    df_docs: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Merge wide topic-loading columns into the extraction summary and overwrite the QC CSV.
+    """
+    all_loadings = tf_results["first_doc_topics_df"].copy()
+    all_loadings = all_loadings.merge(df_docs[["document", "file"]], on="document", how="left")
+
+    tf_cols = [c for c in all_loadings.columns if c.startswith("topic_loading_")]
+    all_loadings = all_loadings[["file"] + tf_cols].drop_duplicates("file")
+
+    extraction_summary = extraction_summary.merge(all_loadings, on="file", how="left")
+
+    print("Merged TF loadings into extraction_summary ✓")
+    print("TF columns added:", len(tf_cols))
+
+    return extraction_summary
+
+
+def save_pipeline_outputs(tf_results: dict, out_folder: str) -> None:
+    """Save the final textual-factor output tables to CSV."""
+    tf_results["first_doc_topics_df"].to_csv(os.path.join(out_folder, "first_doc_topics.csv"), index=False)
+    tf_results["topics_words_df"].to_csv(os.path.join(out_folder, "topics_words.csv"), index=False)
+    tf_results["singular_values_df"].to_csv(os.path.join(out_folder, "singular_values.csv"), index=False)
+    tf_results["topic_importances_df"].to_csv(os.path.join(out_folder, "topic_importances.csv"), index=False)
+
+
+# ------------------------------------------------------------
+# 8C. MAIN PIPELINE RUNNER
+# ------------------------------------------------------------
+def run_pipeline() -> dict:
+    """
+    Run the full pipeline from raw PDF text extraction to saved CSV outputs.
+
+    Returns
+    -------
+    dict
+        Dictionary containing the main in-memory outputs and key output paths.
+    """
+    print("\n=== STEP 1: Load text blocks from PDFs ===")
+    allowed_years = _parse_years_from_run_label(RUN_LABEL)
+    if allowed_years is None:
+        page_ranges_year = page_ranges
+    else:
+        page_ranges_year = {}
+        for fname, rng in page_ranges.items():
+            _bank, file_year = _parse_bank_year_from_filename(fname)
+            if file_year in allowed_years:
+                page_ranges_year[fname] = rng
+
+        if not page_ranges_year:
+            raise RuntimeError(
+                f"RUN_LABEL={RUN_LABEL} did not match any files in page_ranges."
+            )
+    if allowed_years is None:
+        print("Running analysis on FULL corpus (all years)")
+    else:
+        years_sorted = sorted(allowed_years)
+        print(f"Running analysis on filtered years: {years_sorted}")
     print(f"Total files included: {len(page_ranges_year)}")
 
-    report_paragraphs, report_sources = load_report_paragraphs(
+    report_text_blocks, report_sources = load_report_text_blocks(
         reports_folder,
         page_ranges_year,
         strict=STRICT_PAGE_RANGES
     )
-    print(f"Loaded {len(report_paragraphs)} paragraphs")
-    if len(report_paragraphs) == 0:
+    print(f"Loaded {len(report_text_blocks)} text blocks")
+    if len(report_text_blocks) == 0:
         raise RuntimeError(
-            f"Loaded 0 paragraphs. Check PDFs exist in: {reports_folder} and filenames match page_ranges keys."
+            f"Loaded 0 text blocks. Check PDFs exist in: {reports_folder} and filenames match page_ranges keys."
         )
-    df_paragraphs = pd.DataFrame({
-        "content": report_paragraphs,
-        "file": report_sources
-    })
-    # Clean + tokenize paragraphs for Word2Vec training
-    df_paragraphs = preprocess_text_and_tokens(df_paragraphs, text_col="content", tokens_col="tokens")
+
+    df_text_blocks = pd.DataFrame({"content": report_text_blocks})
+    df_text_blocks = preprocess_text_and_tokens(df_text_blocks, text_col="content", tokens_col="tokens")
 
     print("\n=== STEP 2: Build document-level DataFrame ===")
-    df_docs = build_document_dataframe(report_paragraphs, report_sources)
+    df_docs = build_document_dataframe(report_text_blocks, report_sources)
 
     print("\n=== STEP 3: Clean text + tokenize + count words ===")
     df_docs = preprocess_text_and_tokens(df_docs, text_col="content", tokens_col="tokens")
     df_docs_before_doclen_filter = df_docs.copy()
-
     df_docs = df_docs[df_docs["tokens"].apply(len) >= MIN_DOC_TOKENS].copy()
+
     out_folder = os.path.join(TEXT_ANALYTICS_DIR, "outputs_textual_factors")
     os.makedirs(out_folder, exist_ok=True)
 
@@ -1003,108 +1344,66 @@ def main():
         year_label=RUN_LABEL,
     )
     summary_path = os.path.join(out_folder, "extraction_summary_ALL_V1.csv")
-    extraction_summary.to_csv(summary_path, index=False)
-    print(f"\nSaved extraction summary to: {summary_path}")
-    print(extraction_summary.head(10))
-
 
     print("\n=== STEP 4: Create OpenAI Embeddings ===")
     vocab, embedding_matrix = train_openai_embeddings(
-        df_paragraphs,
+        df_text_blocks,
         model_name=EMBEDDING_MODEL,
         batch_size=EMBEDDING_BATCH_SIZE,
     )
-    print(f"Vocabulary size: {len(vocab)}")
 
     print(f"\n=== STEP 5: Cluster word embeddings (sequential clustering; target_cluster_size={TARGET_CLUSTER_SIZE}) ===")
-    ec, clusters, cluster_words_map, word_cluster_map = cluster_words(
+    _, clusters, cluster_words_map, word_cluster_map = cluster_words(
         embedding_matrix,
         target_cluster_size=TARGET_CLUSTER_SIZE,
         neighbor_alg=NEIGHBOR_ALG
     )
-    print(f"Number of clusters: {len(clusters)}")
 
     print("\n=== STEP 6: Build document-word and word-cluster tables ===")
     document_word_data = build_document_word_data(df_docs, vocab)
-    word_cluster_data  = build_word_cluster_data(vocab, word_cluster_map)
-
-    print(document_word_data.head())
-    print(word_cluster_data.head())
+    word_cluster_data = build_word_cluster_data(vocab, word_cluster_map)
 
     print("\n=== STEP 7: Compute Textual Factors (SVD / LSA) ===")
     tf_results = compute_textual_factors(
         document_word_data,
         word_cluster_data,
-        n_topics=N_TOPICS_PER_CLUSTER,
     )
 
-    # ------------------------------------------------------------
-    # Drop topics with low singular values - only if applied
-    # ------------------------------------------------------------
-    if MIN_SINGULAR_VALUE > 0:
-        sv_df = tf_results["singular_values_df"].copy()
+    tf_results = apply_singular_value_filter(tf_results, MIN_SINGULAR_VALUE)
 
-        keep_clusters = sv_df.loc[
-            sv_df["leading_singular"] >= MIN_SINGULAR_VALUE,
-            "cluster"
-        ].astype(int).tolist()
-
-        tf_results["first_doc_topics_df"] = tf_results["first_doc_topics_df"].query(
-            "cluster_id in @keep_clusters").copy()
-
-        if not tf_results["second_doc_topics_df"].empty:
-            tf_results["second_doc_topics_df"] = tf_results["second_doc_topics_df"].query(
-                "cluster_id in @keep_clusters").copy()
-
-        tf_results["topics_words_df"] = tf_results["topics_words_df"].query("cluster_id in @keep_clusters").copy()
-
-        if not tf_results["topics_words2_df"].empty:
-            tf_results["topics_words2_df"] = tf_results["topics_words2_df"].query("cluster_id in @keep_clusters").copy()
-
-        tf_results["singular_values_df"] = sv_df.query("cluster in @keep_clusters").copy()
-        tf_results["topic_importances_df"] = tf_results["topic_importances_df"].query(
-            "cluster_id in @keep_clusters").copy()
-
-    if N_TOPICS_PER_CLUSTER < 2:
-        print("\nNote: N_TOPICS_PER_CLUSTER=1, so TF2 outputs are skipped.")
-
-    # ------------------------------------------------------------
-    # Merge ALL TF topic-loadings into extraction summary (wide)
-    # ------------------------------------------------------------
     if MERGE_ALL_TF_LOADINGS_IN_EXTRACTION_SUMMARY:
-        all_loadings = tf_results["first_doc_topics_df"].copy()
+        extraction_summary = merge_tf_loadings_into_extraction_summary(
+            extraction_summary=extraction_summary,
+            tf_results=tf_results,
+            df_docs=df_docs,
+        )
 
-        # Attach file names (document -> file)
-        all_loadings = all_loadings.merge(df_docs[["document", "file"]], on="document", how="left")
-
-        # Keep 1 row per file with all topic_loading_* columns
-        tf_cols = [c for c in all_loadings.columns if c.startswith("topic_loading_")]
-        all_loadings = all_loadings[["file"] + tf_cols].drop_duplicates("file")
-
-        # Merge into extraction summary
-        extraction_summary = extraction_summary.merge(all_loadings, on="file", how="left")
-
-        # Overwrite SAME CSV (so you only have one document)
-        extraction_summary.to_csv(summary_path, index=False)
-
-        print("Merged TF loadings into extraction_summary and overwrote extraction_summary_ALL_V1.csv ✓")
-        print("TF columns added:", len(tf_cols))
-
+    extraction_summary.to_csv(summary_path, index=False)
+    print(f"\nSaved extraction summary to: {summary_path}")
+    print(extraction_summary.head(10))
 
     print("\n=== Saving results ===")
-    tf_results["first_doc_topics_df"].to_csv(os.path.join(out_folder, "first_doc_topics.csv"), index=False)
-
-    # Only write TF2 if it exists (n_topics_per_cluster >= 2)
-    if not tf_results["second_doc_topics_df"].empty:
-        tf_results["second_doc_topics_df"].to_csv(os.path.join(out_folder, "second_doc_topics.csv"), index=False)
-
-
-    tf_results["topics_words_df"].to_csv(os.path.join(out_folder, "topics_words.csv"), index=False)
-    tf_results["singular_values_df"].to_csv(os.path.join(out_folder, "singular_values.csv"), index=False)
-    tf_results["topic_importances_df"].to_csv(os.path.join(out_folder, "topic_importances.csv"), index=False)
+    save_pipeline_outputs(tf_results, out_folder)
 
     print("\nPipeline finished ✓")
     print("Outputs written to:", out_folder)
 
+    return {
+        "df_text_blocks": df_text_blocks,
+        "df_docs": df_docs,
+        "extraction_summary": extraction_summary,
+        "vocab": vocab,
+        "embedding_matrix": embedding_matrix,
+        "clusters": clusters,
+        "cluster_words_map": cluster_words_map,
+        "word_cluster_map": word_cluster_map,
+        "document_word_data": document_word_data,
+        "word_cluster_data": word_cluster_data,
+        "tf_results": tf_results,
+        "out_folder": out_folder,
+        "summary_path": summary_path,
+    }
+
+
 if __name__ == "__main__":
-    main()
+    run_pipeline()
