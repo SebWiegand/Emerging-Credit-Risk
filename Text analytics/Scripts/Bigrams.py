@@ -25,7 +25,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))                 # .../Text analytics/Scripts
 TEXT_ANALYTICS_DIR = os.path.dirname(SCRIPT_DIR)
 NLTK_DATA_DIR = os.path.join(TEXT_ANALYTICS_DIR, "nltk_data")
-CONG_REP_DIR = os.path.join(TEXT_ANALYTICS_DIR, "Cong et al. rep")      # .../Text analytics/Cong et al. rep
+CONG_REP_DIR = os.path.join(TEXT_ANALYTICS_DIR, "Cong et al. rep")   -   # .../Text analytics/Cong et al. rep
 nltk.data.path = [NLTK_DATA_DIR]
 
 for p in (CONG_REP_DIR, TEXT_ANALYTICS_DIR, SCRIPT_DIR):
